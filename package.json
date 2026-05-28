@@ -1,0 +1,27 @@
+{
+  "name": "jsradio-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Harmonix — Discord music bot (no TTS, just music)",
+  "main": "src/bot.ts",
+  "scripts": {
+    "start": "ts-node src/bot.ts",
+    "dev": "ts-node --watch src/bot.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "edge-tts-node": "^1.5.7",
+    "libsodium-wrappers": "^0.7.13",
+    "opusscript": "^0.1.0",
+    "youtube-music-api": "^1.0.6",
+    "yt-search": "^2.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.16",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
