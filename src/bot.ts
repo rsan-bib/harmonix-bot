@@ -4,11 +4,11 @@ dotenv.config();
 import {
   Client,
   GatewayIntentBits,
-  SlashCommandBuilder,
   ChatInputCommandInteraction,
   GuildMember,
   TextChannel,
   EmbedBuilder,
+  VoiceBasedChannel,
 } from 'discord.js';
 import {
   joinVoiceChannel,
@@ -26,6 +26,11 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { writeFile, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
+
+// Tipos de dominio + contrato del motor (compartidos con los comandos).
+import type { Track, GuildState, Engine } from './types';
+// Registro de comandos (un archivo por comando en ./commands).
+import { commands, commandMap } from './commands';
 
 const execAsync = promisify(exec);
 
@@ -63,36 +68,7 @@ const TTS_LANG = process.env.TTS_LANG || 'es';
 const SAPI_VOICE = process.env.SAPI_VOICE || 'Microsoft Sabina Desktop';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
-interface Track {
-  title: string;
-  url: string;
-  duration: string;
-  source: 'YouTube' | 'Spotify' | 'SoundCloud';
-  // Metadata extra
-  thumbnail?: string;
-  artist?: string;
-  playlist?: string;
-}
-
-interface GuildState {
-  player: AudioPlayer;
-  connection: VoiceConnection;
-  queue: Track[];
-  currentTrack: Track | null;
-  isTransitioning: boolean;
-  textChannel: TextChannel | null;
-  ffmpegProcess: ReturnType<typeof spawn> | null;
-  disconnectTimer: ReturnType<typeof setTimeout> | null;
-  voiceChannelId: string | null;
-  // Radio mode
-  radioMode: boolean;
-  basePlaylistTrackQueries: string[];
-  // Ducking real: necesitamos saber URL y posición para rearrancar ffmpeg con -ss
-  currentMusicUrl: string | null;
-  trackStartedAt: number; // ms epoch cuando el player entró en Playing
-  commentScheduled: boolean; // 1 comentario con ducking por canción máximo
-  lastDjVoice: number; // índice en PIPER_MODELS de la última voz usada (para alternar el dúo)
-}
+// Track y GuildState ahora viven en ./types (compartidos con los comandos).
 
 // ─── Estado ───────────────────────────────────────────────────────────────────
 const client = new Client({
@@ -1008,7 +984,14 @@ async function speakWithDucking(guildId: string, texto: string, voiceModel?: str
       console.error(`❌ ffmpeg(duck) error [${guildId}]:`, err.message);
     });
 
-    const resource = createAudioResource(ff.stdout!, { inputType: StreamType.OggOpus });
+    const resource = createAudioResource(ff.stdout!, {
+      inputType: StreamType.OggOpus,
+      inlineVolume: true,
+    });
+    // Tras el ducking re-aplicamos el volumen del guild: si no, el tema vuelve a
+    // sonar al 100% y /volume quedaría apuntando a un resource muerto.
+    estado.currentResource = resource;
+    resource.volume?.setVolume(estado.volume ?? 1.0);
     estado.player.play(resource);
 
     // Mantener trackStartedAt coherente: la música arrancó hace `elapsed` segundos lógicamente.
@@ -1053,60 +1036,37 @@ function buildNowPlayingMessage(track: Track, isRadio: boolean): string {
   return `🎵 **Sonando ahora:** ${track.title} [${track.duration}]${radioTag}`;
 }
 
+// ─── Motor expuesto a los comandos ────────────────────────────────────────────
+// Los archivos de ./commands reciben este objeto vía CommandContext.engine.
+// Centraliza el acceso al estado y a la lógica de audio/búsqueda/TTS sin que los
+// comandos importen bot.ts (evita ciclos de import).
+const engine: Engine = {
+  estados,
+  BOT_NAME,
+  CHISTES,
+  searchYouTube,
+  searchSpotify,
+  searchSoundCloud,
+  resolveSpotifyUrl,
+  getTrackMetadata,
+  detectarFuente,
+  getRadioPlaylistTracks,
+  buildPlayingEmbed,
+  playDjAnnouncement,
+  refillRadioQueue,
+  ensureGuild,
+  playNextFromQueue,
+  killFfmpeg,
+  limpiarEstado,
+};
+
 // ─── Cliente Discord ─────────────────────────────────────────────────────────
 
 client.on('clientReady', async () => {
   console.log(`⚡ ${BOT_NAME} conectado como ${client.user?.tag}`);
 
-  const comandos = [
-    new SlashCommandBuilder()
-      .setName('play')
-      .setDescription('Reproduce música')
-      .addStringOption((opt) =>
-        opt.setName('cancion').setDescription('Nombre del tema o URL').setRequired(true)
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName('fuente')
-          .setDescription('auto, yt, sp o scld')
-          .setRequired(false)
-          .addChoices(
-            { name: 'auto — Spotify, YouTube, SoundCloud', value: 'auto' },
-            { name: 'yt — solo YouTube', value: 'yt' },
-            { name: 'sp — solo Spotify', value: 'sp' },
-            { name: 'scld — solo SoundCloud', value: 'scld' }
-          )
-      ),
-    new SlashCommandBuilder()
-      .setName('radio')
-      .setDescription('Activa o desactiva el modo radio JS RADIO')
-      .addStringOption((opt) =>
-        opt.setName('accion').setDescription('on, off o joke').setRequired(false)
-          .addChoices(
-            { name: 'on — activa el DJ', value: 'on' },
-            { name: 'off — desactiva el DJ', value: 'off' },
-            { name: 'joke — chiste del DJ', value: 'joke' }
-          )
-      ),
-    new SlashCommandBuilder()
-      .setName('skip')
-      .setDescription('Salta al siguiente tema'),
-    new SlashCommandBuilder()
-      .setName('stop')
-      .setDescription('Detiene la música y desconecta el bot'),
-    new SlashCommandBuilder()
-      .setName('queue')
-      .setDescription('Muestra los temas en cola'),
-    new SlashCommandBuilder()
-      .setName('nowplaying')
-      .setDescription('Muestra el tema que está sonando ahora'),
-    new SlashCommandBuilder()
-      .setName('help')
-      .setDescription('Muestra todos los comandos disponibles'),
-  ];
-
-  await client.application?.commands.set(comandos.map((c) => c.toJSON()));
-  console.log(`✅ Comandos slash registrados`);
+  await client.application?.commands.set(commands.map((c) => c.data.toJSON()));
+  console.log(`✅ ${commands.length} comandos slash registrados`);
 });
 
 // ─── Auto-desconectar si no hay nadie ─────────────────────────────────────────
@@ -1157,8 +1117,10 @@ client.on('interactionCreate', async (interaction) => {
     const member = interaction.member as GuildMember;
     const voiceChannel = member.voice?.channel;
 
-    const necesitaVoz = ['play', 'skip', 'stop', 'radio'];
-    if (necesitaVoz.includes(commandName) && !voiceChannel) {
+    const command = commandMap.get(commandName);
+    if (!command) return;
+
+    if (command.needsVoice && !voiceChannel) {
       await interaction.reply({
         content: '❌ Tenés que estar en un canal de voz para usar este comando.',
         ephemeral: true,
@@ -1166,31 +1128,13 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    const guildState = estados.get(guildId);
-
-    switch (commandName) {
-      case 'play':
-        await handlePlay(interaction, guildId, member);
-        break;
-      case 'radio':
-        await handleRadio(interaction, guildId, member, guildState);
-        break;
-      case 'skip':
-        await handleSkip(interaction, guildId, guildState);
-        break;
-      case 'stop':
-        await handleStop(interaction, guildId, guildState);
-        break;
-      case 'queue':
-        await handleQueue(interaction, guildState);
-        break;
-      case 'nowplaying':
-        await handleNowPlaying(interaction, guildState);
-        break;
-      case 'help':
-        await handleHelp(interaction);
-        break;
-    }
+    await command.execute({
+      interaction,
+      guildId,
+      member,
+      state: estados.get(guildId),
+      engine,
+    });
   } catch (err: any) {
     console.error('❌ Error en interactionCreate:', err);
     try {
@@ -1207,365 +1151,68 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ─── Comando /play ────────────────────────────────────────────────────────────
-
-async function handlePlay(
-  interaction: ChatInputCommandInteraction,
+// ─── Crear/obtener estado del guild ───────────────────────────────────────────
+// Los comandos (en ./commands) no arman GuildState a mano: delegan acá para que
+// la forma del estado y los listeners del player vivan en un solo lugar.
+async function ensureGuild(
   guildId: string,
-  member: GuildMember
-) {
-  await interaction.deferReply();
-  const query = interaction.options.getString('cancion', true);
-  const fuente = interaction.options.getString('fuente') || 'auto';
-  const voiceChannel = member.voice?.channel!;
-  const textChannel = interaction.channel as TextChannel;
+  voiceChannel: VoiceBasedChannel,
+  textChannel: TextChannel
+): Promise<GuildState> {
+  let estado = estados.get(guildId);
 
-  try {
-    const esUrl = /^https?:\/\//.test(query);
-    let tracksToQueue: { track: Track; fuenteHallazgo: string }[] = [];
+  if (!estado) {
+    console.log(`🔊 Conectando a canal de voz: ${voiceChannel.name} [${voiceChannel.id}]`);
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    });
 
-    if (esUrl) {
-      const urlFuente = detectarFuente(query);
+    const player = createAudioPlayer();
+    connection.subscribe(player);
 
-      if (urlFuente === 'Spotify') {
-        const info = await resolveSpotifyUrl(query);
-        if (info && info.tracks.length > 0) {
-          for (const t of info.tracks) {
-            const ytQuery = `${t.artist} - ${t.name}`;
-            const ytTrack = await searchYouTube(ytQuery);
-            if (ytTrack) {
-              tracksToQueue.push({
-                track: { ...ytTrack, source: 'Spotify' },
-                fuenteHallazgo: info.isPlaylist
-                  ? `Spotify Playlist → YouTube (${t.name})`
-                  : `Spotify → YouTube (${t.name} — ${t.artist})`,
-              });
-            }
-          }
-        }
-      } else if (urlFuente === 'SoundCloud') {
-        const scTrack = await searchSoundCloud(query);
-        if (scTrack) {
-          tracksToQueue.push({
-            track: scTrack,
-            fuenteHallazgo: 'SoundCloud (URL directa)',
-          });
-        }
-      } else {
-        // YouTube URL: obtener metadata completa
-        const meta = await getTrackMetadata(query);
-        tracksToQueue.push({
-          track: {
-            title: meta?.title || query,
-            url: query,
-            duration: meta?.duration || '?',
-            source: 'YouTube',
-            thumbnail: meta?.thumbnail,
-            artist: meta?.artist,
-          },
-          fuenteHallazgo: 'YouTube (URL directa)',
-        });
-      }
-    } else {
-      // Búsqueda por texto
-      if (fuente === 'yt') {
-        const track = await searchYouTube(query);
-        if (track) tracksToQueue.push({ track, fuenteHallazgo: 'YouTube' });
-      } else if (fuente === 'sp') {
-        const s = await searchSpotify(query);
-        if (s) {
-          const yt = await searchYouTube(`${s.artist} - ${s.name}`);
-          if (yt) {
-            tracksToQueue.push({
-              track: { ...yt, source: 'Spotify' },
-              fuenteHallazgo: `Spotify → YouTube (${s.name} — ${s.artist})`,
-            });
-          }
-        }
-      } else if (fuente === 'scld') {
-        const track = await searchSoundCloud(query);
-        if (track) tracksToQueue.push({ track, fuenteHallazgo: 'SoundCloud' });
-      } else {
-        // auto: 3 fuentes en paralelo
-        const [spotify, ytResult, scResult] = await Promise.all([
-          searchSpotify(query).then(async (s) => {
-            if (!s) return null;
-            const yt = await searchYouTube(`${s.artist} - ${s.name}`);
-            if (!yt) return null;
-            return { track: { ...yt, source: 'Spotify' as const }, fuente: `Spotify → YouTube (${s.name} — ${s.artist})` };
-          }),
-          searchYouTube(query).then((yt) => {
-            if (!yt) return null;
-            return { track: yt, fuente: 'YouTube' };
-          }),
-          searchSoundCloud(query).then((sc) => {
-            if (!sc) return null;
-            return { track: sc, fuente: 'SoundCloud' };
-          }),
-        ]);
-        const ganador = spotify || ytResult || scResult;
-        if (ganador) tracksToQueue.push({ track: ganador.track, fuenteHallazgo: ganador.fuente });
-      }
-    }
+    const playlistTracks = await getRadioPlaylistTracks();
 
-    if (tracksToQueue.length === 0) {
-      await interaction.editReply(`❌ No encontré "${query}" en ninguna plataforma.`);
-      return;
-    }
+    estado = {
+      player,
+      connection,
+      queue: [],
+      currentTrack: null,
+      isTransitioning: false,
+      textChannel,
+      ffmpegProcess: null,
+      disconnectTimer: null,
+      voiceChannelId: voiceChannel.id,
+      radioMode: false,
+      basePlaylistTrackQueries: playlistTracks,
+      currentMusicUrl: null,
+      trackStartedAt: 0,
+      commentScheduled: false,
+      lastDjVoice: 0,
+      // Controles nuevos
+      volume: 1.0,
+      loopMode: 'off',
+      currentResource: null,
+      skipRequested: false,
+      seedTrack: null,
+    };
+    estados.set(guildId, estado);
 
-    // ── Obtener o crear estado del guild ───────────────────────────────
-    let estado = estados.get(guildId);
-
-    if (!estado) {
-      console.log(`🔊 Conectando a canal de voz: ${voiceChannel.name} [${voiceChannel.id}]`);
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: voiceChannel.guild.id,
-        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      });
-
-      const player = createAudioPlayer();
-      connection.subscribe(player);
-
-      const playlistTracks = await getRadioPlaylistTracks();
-
-      estado = {
-        player,
-        connection,
-        queue: [],
-        currentTrack: null,
-        isTransitioning: false,
-        textChannel,
-        ffmpegProcess: null,
-        disconnectTimer: null,
-        voiceChannelId: voiceChannel.id,
-        radioMode: false,
-        basePlaylistTrackQueries: playlistTracks,
-        currentMusicUrl: null,
-        trackStartedAt: 0,
-        commentScheduled: false,
-        lastDjVoice: 0,
-      };
-      estados.set(guildId, estado);
-
-      player.on(AudioPlayerStatus.Idle, () => {
-        const e = estados.get(guildId);
-        if (!e) return;
-        onTrackEnd(guildId);
-      });
-      player.on('error', (err) => {
-        console.error(`❌ Error en player [${guildId}]:`, err.message);
-        onTrackEnd(guildId);
-      });
-    } else {
-      estado.textChannel = textChannel;
-    }
-
-    // Agregar tracks a la cola
-    const firstTrack = tracksToQueue[0].track;
-    const newTracks = tracksToQueue.map((t) => t.track);
-
-    if (estado.radioMode && estado.currentTrack) {
-      // En modo radio, los pedidos del usuario van JUSTO DESPUÉS de la actual,
-      // por encima de los temas auto-rellenados de la playlist base.
-      // queue[0] es la track actual sonando; insertamos en queue[1].
-      const insertAt = estado.queue[0] === estado.currentTrack ? 1 : 0;
-      estado.queue.splice(insertAt, 0, ...newTracks);
-    } else {
-      estado.queue.push(...newTracks);
-    }
-
-    if (estado.currentTrack === null && !estado.isTransitioning) {
-      await playNextFromQueue(guildId);
-    }
-
-    // Mensaje de confirmación con embed
-    const embed = buildPlayingEmbed(firstTrack, estado.radioMode);
-
-    if (tracksToQueue.length === 1) {
-      await interaction.editReply({
-        content: `🎵 **${BOT_NAME}** — ${tracksToQueue[0].fuenteHallazgo}`,
-        embeds: [embed],
-      });
-    } else {
-      await interaction.editReply({
-        content: `🎵 **${BOT_NAME}**: "${firstTrack.title}" + ${tracksToQueue.length - 1} temas más agregados a la cola.`,
-        embeds: [embed],
-      });
-    }
-  } catch (err: any) {
-    console.error('Error en /play:', err);
-    await interaction.editReply(`❌ Error al reproducir: ${err.message || 'Error desconocido'}`);
-  }
-}
-
-// ─── Comando /radio ───────────────────────────────────────────────────────────
-
-async function handleRadio(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  member: GuildMember,
-  guildState: GuildState | undefined
-) {
-  await interaction.deferReply();
-  const accion = interaction.options.getString('accion') || 'toggle';
-
-  if (accion === 'joke') {
-    const chiste = CHISTES[Math.floor(Math.random() * CHISTES.length)];
-    if (guildState?.textChannel) {
-      guildState.textChannel.send(`🎙️ **JS RADIO DJ:** ${chiste}`).catch(() => {});
-      // También reproducir como audio
-      playDjAnnouncement(guildId, 'joke');
-    }
-    await interaction.editReply(`🎙️ DJ dice: "${chiste}"`);
-    return;
-  }
-
-  let nuevoEstado = true;
-
-  if (accion === 'off') {
-    nuevoEstado = false;
-  } else if (accion === 'on') {
-    nuevoEstado = true;
-  } else {
-    nuevoEstado = !guildState?.radioMode;
-  }
-
-  if (!guildState) {
-    await interaction.editReply(
-      '❌ Primero usá `/play` para conectar el bot a un canal de voz.'
-    );
-    return;
-  }
-
-  guildState.radioMode = nuevoEstado;
-
-  if (nuevoEstado) {
-    guildState.basePlaylistTrackQueries = await getRadioPlaylistTracks();
-
-    if (guildState.textChannel) {
-      await guildState.textChannel.send({
-        content: `🔥 **JS RADIO — Modo Radio ACTIVADO** 🔥\n` +
-                 `🎙️ El DJ está en la casa! Bass Arena mode: ON\n` +
-                 `🎵 La mejor música sin parar.\n` +
-                 `📢 Usá \`/radio joke\` para un chiste del DJ.`,
-      });
-    }
-
-    // DJ intro
-    setTimeout(() => playDjAnnouncement(guildId, 'intro'), 2000);
-
-    await interaction.editReply({
-      content: `🔥 **JS RADIO modo radio: ON**\n` +
-               `🎙️ El DJ te va a acompañar cada tema con anuncios y más.`,
+    player.on(AudioPlayerStatus.Idle, () => {
+      const e = estados.get(guildId);
+      if (!e) return;
+      onTrackEnd(guildId);
+    });
+    player.on('error', (err) => {
+      console.error(`❌ Error en player [${guildId}]:`, err.message);
+      onTrackEnd(guildId);
     });
   } else {
-    if (guildState.textChannel) {
-      await guildState.textChannel.send({
-        content: `🔇 **JS RADIO — Modo Radio DESACTIVADO**\n` +
-                 `🎙️ El DJ se va a tomar un break. Siguiente tema: sin anuncios.`,
-      });
-    }
-    await interaction.editReply(`🔇 **JS RADIO modo radio: OFF**`);
-  }
-}
-
-// ─── Comando /skip ────────────────────────────────────────────────────────────
-
-async function handleSkip(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || !guildState.currentTrack) {
-    await interaction.reply('❌ No está sonando nada para saltar.');
-    return;
+    estado.textChannel = textChannel;
   }
 
-  killFfmpeg(guildState);
-  guildState.player.stop();
-  await interaction.reply(`⏭️ Salté "${guildState.currentTrack.title}".`);
-}
-
-// ─── Comando /stop ────────────────────────────────────────────────────────────
-
-async function handleStop(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  guildState: GuildState | undefined
-) {
-  if (!guildState) {
-    await interaction.reply('❌ El bot no está conectado a ningún canal.');
-    return;
-  }
-
-  limpiarEstado(guildId);
-  await interaction.reply(`🛑 **${BOT_NAME}** se desconectó. Nos escuchamos.`);
-}
-
-// ─── Comando /queue ───────────────────────────────────────────────────────────
-
-async function handleQueue(
-  interaction: ChatInputCommandInteraction,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || guildState.queue.length === 0) {
-    await interaction.reply('📭 La cola está vacía. Usá `/play` para agregar temas.');
-    return;
-  }
-
-  const canciones = guildState.queue
-    .map((t, i) => `**${i + 1}.** ${t.title} [${t.duration}] — ${t.source}`)
-    .join('\n');
-
-  const modoRadio = guildState.radioMode ? '\n\n🔥 **Modo Radio: ON** (el DJ te acompaña!)' : '';
-
-  await interaction.reply({
-    content: `📋 **Cola de reproducción:**\n${canciones}${modoRadio}`,
-  });
-}
-
-// ─── Comando /nowplaying ──────────────────────────────────────────────────────
-
-async function handleNowPlaying(
-  interaction: ChatInputCommandInteraction,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || !guildState.currentTrack) {
-    await interaction.reply('❌ No está sonando nada ahora.');
-    return;
-  }
-
-  const track = guildState.currentTrack;
-  const embed = buildPlayingEmbed(track, guildState.radioMode);
-
-  await interaction.reply({ embeds: [embed] });
-}
-
-// ─── Comando /help ─────────────────────────────────────────────────────────────
-
-async function handleHelp(interaction: ChatInputCommandInteraction) {
-  const msg = [
-    `**${BOT_NAME} — Comandos**`,
-    '',
-    '🎵 **/play** `cancion:` [título/URL] `fuente:` auto|yt|sp|scld',
-    '   › *auto*: busca en Spotify→YouTube, YouTube y SoundCloud',
-    '   › *yt*: solo YouTube',
-    '   › *sp*: solo Spotify → YouTube',
-    '   › *scld*: solo SoundCloud',
-    '🔥 **/radio** `accion:` on|off|joke|toggle',
-    '   › *on*: activa el modo radio con DJ',
-    '   › *off*: desactiva el modo radio',
-    '   › *joke*: el DJ cuenta un chiste ahora',
-    '   › *toggle*: activa/desactiva (sin argumentos)',
-    '⏭️ **/skip** — salta al siguiente tema',
-    '🛑 **/stop** — detiene la música y desconecta el bot',
-    '📋 **/queue** — muestra los temas en cola',
-    '🎶 **/nowplaying** — muestra el tema actual con embed',
-    '❓ **/help** — muestra esta ayuda',
-  ].join('\n');
-
-  await interaction.reply({ content: msg, ephemeral: true });
+  return estado;
 }
 
 // ─── Lógica de reproducción ───────────────────────────────────────────────────
@@ -1674,15 +1321,131 @@ function spawnFfmpeg(musicUrl: string) {
 
 // ─── Auto-cola en modo radio ─────────────────────────────────────────────────
 
+// ─── Radio sembrada: temas parecidos al seed ──────────────────────────────────
+
+function formatDuration(raw?: string): string {
+  const s = parseInt(raw || '', 10);
+  if (!Number.isFinite(s) || s <= 0) return '?';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function extractYouTubeId(url: string): string | null {
+  const m = url.match(/(?:v=|youtu\.be\/|\/watch\?.*v=)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+async function resolveYouTubeVideoId(seed: Track): Promise<string | null> {
+  const direct = extractYouTubeId(seed.url);
+  if (direct) return direct;
+  // Seed no-YouTube (Spotify/SoundCloud): lo buscamos en YouTube para tener videoId.
+  const q = seed.artist ? `${seed.artist} - ${seed.title}` : seed.title;
+  const yt = await searchYouTube(q);
+  return yt ? extractYouTubeId(yt.url) : null;
+}
+
+// Cascada: Spotify Recommendations (elección del usuario) → fallback YouTube Mix.
+// Spotify deprecó /v1/recommendations (27-nov-2024) para apps sin acceso extendido;
+// si responde 404/vacío caemos solo a YouTube Mix (radio RD<videoId> vía yt-dlp).
+async function getSimilarTracks(seed: Track): Promise<Track[]> {
+  // 1) Spotify Recommendations
+  try {
+    const token = await getSpotifyToken();
+    if (token) {
+      const sp = await searchSpotify(seed.artist ? `${seed.artist} - ${seed.title}` : seed.title);
+      if (sp) {
+        const res = await fetch(
+          `https://api.spotify.com/v1/recommendations?seed_tracks=${sp.id}&limit=10`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.ok) {
+          const data: any = await res.json();
+          const recs: any[] = data.tracks || [];
+          const tracks: Track[] = [];
+          for (const r of recs) {
+            const yt = await searchYouTube(`${r.artists?.[0]?.name || ''} - ${r.name}`);
+            if (yt) tracks.push({ ...yt, source: 'Spotify' });
+          }
+          if (tracks.length > 0) {
+            console.log(`🎯 Similares vía Spotify Recommendations: ${tracks.length}`);
+            return tracks;
+          }
+        } else {
+          console.warn(`⚠️ Spotify Recommendations no disponible (HTTP ${res.status}); uso YouTube Mix.`);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ Spotify Recommendations falló: ${err.message}; uso YouTube Mix.`);
+  }
+
+  // 2) Fallback: YouTube Mix (radio RD<videoId>)
+  try {
+    const videoId = await resolveYouTubeVideoId(seed);
+    if (!videoId) return [];
+    // id y duration primero (sin tabs); el título va último porque puede contener tabs.
+    const { stdout } = await execAsync(
+      `"${YTDLP}" --flat-playlist --no-warnings --print "%(id)s\t%(duration)s\t%(title)s" "https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}"`,
+      { timeout: 30000 }
+    );
+    const lines = stdout.trim().split('\n').filter((l: string) => l.trim().length > 0);
+    const tracks: Track[] = [];
+    for (const line of lines.slice(0, 12)) {
+      const tab1 = line.indexOf('\t');
+      const tab2 = line.indexOf('\t', tab1 + 1);
+      if (tab1 === -1 || tab2 === -1) continue;
+      const id = line.slice(0, tab1);
+      const dur = line.slice(tab1 + 1, tab2);
+      const title = line.slice(tab2 + 1);
+      if (!id) continue;
+      // El primer item del mix suele ser el seed mismo → lo saltamos.
+      if (id === videoId) continue;
+      tracks.push({
+        title: title || 'Tema',
+        url: `https://www.youtube.com/watch?v=${id}`,
+        duration: formatDuration(dur),
+        source: 'YouTube',
+      });
+    }
+    if (tracks.length > 0) console.log(`🎯 Similares vía YouTube Mix: ${tracks.length}`);
+    return tracks;
+  } catch (err: any) {
+    console.warn(`⚠️ YouTube Mix falló: ${err.message}`);
+    return [];
+  }
+}
+
 async function refillRadioQueue(guildId: string) {
   const estado = estados.get(guildId);
   if (!estado) return;
 
+  let added = 0;
+
+  // Radio sembrada: si hay un tema semilla, rellenamos con PARECIDOS a ese tema.
+  if (estado.seedTrack) {
+    const similares = await getSimilarTracks(estado.seedTrack);
+    for (const track of similares) {
+      if (estado.queue.length >= 10) break;
+      if (!estado.queue.find((t) => t.url === track.url)) {
+        estado.queue.push(track);
+        added++;
+      }
+    }
+    if (added > 0) {
+      console.log(`📻 Auto-rellenado (sembrado): ${added} tracks [${guildId}]`);
+      return;
+    }
+    // Si no salieron similares, caemos a la playlist base de abajo.
+  }
+
+  // Fallback final: playlist hardcodeada (comportamiento original).
   const baseTracks = estado.basePlaylistTrackQueries;
   if (baseTracks.length === 0) return;
 
-  const shuffled = baseTracks.sort(() => Math.random() - 0.5);
-  let added = 0;
+  // Copia antes de mezclar: .sort() muta in-place y baseTracks es estado persistente
+  // (compartido entre rellenos), no se debe reordenar la fuente original.
+  const shuffled = [...baseTracks].sort(() => Math.random() - 0.5);
 
   for (const query of shuffled.slice(0, 5)) {
     if (estado.queue.length >= 10) break;
@@ -1750,8 +1513,12 @@ async function playCurrentTrack(guildId: string): Promise<void> {
 
     const resource = createAudioResource(ff.stdout!, {
       inputType: StreamType.OggOpus,
-      inlineVolume: false,
+      inlineVolume: true,
     });
+    // Guardamos el resource y aplicamos el volumen del guild para que /volume
+    // pueda ajustarlo en vivo y el nivel persista entre temas.
+    estado.currentResource = resource;
+    resource.volume?.setVolume(estado.volume ?? 1.0);
 
     // Logging de transiciones de estado del player para diagnosticar dónde muere
     estado.player.removeAllListeners('stateChange');
@@ -1800,10 +1567,27 @@ async function onTrackEnd(guildId: string) {
 
   if (estado.isTransitioning) return;
 
-  // Sacar la track actual de la queue
+  // ── Loop ────────────────────────────────────────────────────────────────────
+  // El modo radio tiene prioridad: el auto-relleno manda y el loop se ignora.
+  const skipForzado = estado.skipRequested;
+  estado.skipRequested = false;
+
+  // loop=track: repetir el mismo tema, salvo que el fin haya sido un /skip manual.
+  if (estado.loopMode === 'track' && !skipForzado && !estado.radioMode && estado.currentTrack) {
+    await playCurrentTrack(guildId);
+    return;
+  }
+
+  // Sacar la track actual de la queue (o rotarla al final si loop=queue)
   if (estado.currentTrack) {
     const idx = estado.queue.findIndex((t) => t.url === estado.currentTrack!.url);
-    if (idx !== -1) estado.queue.splice(idx, 1);
+    if (idx !== -1) {
+      const [terminado] = estado.queue.splice(idx, 1);
+      // loop=queue: el tema terminado vuelve al final para repetir la cola entera.
+      if (estado.loopMode === 'queue' && !estado.radioMode && terminado) {
+        estado.queue.push(terminado);
+      }
+    }
   }
 
   estado.currentTrack = null;
