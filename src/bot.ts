@@ -4,11 +4,11 @@ dotenv.config();
 import {
   Client,
   GatewayIntentBits,
-  SlashCommandBuilder,
   ChatInputCommandInteraction,
   GuildMember,
   TextChannel,
   EmbedBuilder,
+  VoiceBasedChannel,
 } from 'discord.js';
 import {
   joinVoiceChannel,
@@ -26,6 +26,12 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { writeFile, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
+import { GoogleGenAI } from '@google/genai';
+
+// Tipos de dominio + contrato del motor (compartidos con los comandos).
+import type { Track, GuildState, Engine } from './types';
+// Registro de comandos (un archivo por comando en ./commands).
+import { commands, commandMap } from './commands';
 
 const execAsync = promisify(exec);
 
@@ -41,58 +47,34 @@ const FFPROBE = process.env.FFPROBE || (IS_WIN ? 'C:\\Users\\Roko\\ffmpeg\\ffpro
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
 const RADIO_PLAYLIST_ID = '5HoC05C0PLSxNlxiJ3QABu';
-// TTS en cascada: Azure Neural (principal, voz orgánica es-CL) → Google Translate TTS → SAPI offline.
-// Azure necesita AZURE_SPEECH_KEY + AZURE_SPEECH_REGION en .env; si faltan, arranca directo en gTTS.
-// El endpoint WSS gratuito de Edge TTS quedó devolviendo 403 server-side, por eso ya no se usa.
-// Voces chilenas: es-CL-CatalinaNeural (femenina) o es-CL-LorenzoNeural (masculina).
-const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY || '';
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION || '';
-const AZURE_TTS_VOICE = process.env.AZURE_TTS_VOICE || 'es-CL-CatalinaNeural';
-// Piper: TTS neural LOCAL (offline, gratis, ilimitado, sin cuenta). Motor principal efectivo.
-// Voz por defecto: es_MX (mexicano neutro, no argentino). Override de rutas/voz via .env.
+// ─── TTS Config ────────────────────────────────────────────────────────────────
+// Lenguaje para gTTS (fallback de red).
+const TTS_LANG = process.env.TTS_LANG || 'es';
+
+// Piper: TTS neural LOCAL (offline, gratis, ilimitado, sin cuenta).
+// Voz por defecto: es_AR (Daniela, argentino). Override de rutas/voz via .env.
 const PIPER_EXE = process.env.PIPER_EXE || 'C:\\Users\\Roko\\piper\\piper\\piper.exe';
-const PIPER_MODEL = process.env.PIPER_MODEL || 'C:\\Users\\Roko\\piper\\models\\es_MX-claude-high.onnx';
+const PIPER_MODEL = process.env.PIPER_MODEL || 'C:\\Users\\Roko\\piper\\models\\es_AR-daniela-high.onnx';
 // Segundo comentador (dúo): voz distinta. Si existe, se habilita el modo dúo.
 const PIPER_MODEL_2 = process.env.PIPER_MODEL_2 || 'C:\\Users\\Roko\\piper\\models\\es_MX-ald-medium.onnx';
 const PIPER_AVAILABLE = existsSync(PIPER_EXE) && existsSync(PIPER_MODEL);
 // Lista de voces de DJ disponibles (1 o 2). Con 2 se activan diálogos y turnos entre comentadores.
 const PIPER_MODELS = [PIPER_MODEL, PIPER_MODEL_2].filter((m) => existsSync(m));
-const DUO_ENABLED = PIPER_AVAILABLE && PIPER_MODELS.length >= 2;
-// Override via .env: TTS_LANG=es (es, es-419, etc.) y SAPI_VOICE='Microsoft Sabina Desktop'.
-const TTS_LANG = process.env.TTS_LANG || 'es';
-const SAPI_VOICE = process.env.SAPI_VOICE || 'Microsoft Sabina Desktop';
+// Dúo (dos voces alternando) DESACTIVADO por defecto: el DJ habla con una sola voz.
+// Se puede reactivar con DJ_DUO=1 en el .env.
+const DUO_ENABLED = PIPER_AVAILABLE && PIPER_MODELS.length >= 2 && process.env.DJ_DUO === '1';
+
+// Gemini: descripciones cortas reales de cada canción + TTS (key gratis en ai.google.dev).
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+// Gemini TTS: voz femenina chilena (misma key gratis).
+// Voces femeninas disponibles: Kore, Leda, Aoede, Zephyr, Autonoe, Callirrhoe.
+const GEMINI_TTS_DISABLED = process.env.GEMINI_TTS_DISABLED === '1';
+const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+const GEMINI_TTS_VOICE = process.env.GEMINI_TTS_VOICE || 'Kore';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
-interface Track {
-  title: string;
-  url: string;
-  duration: string;
-  source: 'YouTube' | 'Spotify' | 'SoundCloud';
-  // Metadata extra
-  thumbnail?: string;
-  artist?: string;
-  playlist?: string;
-}
-
-interface GuildState {
-  player: AudioPlayer;
-  connection: VoiceConnection;
-  queue: Track[];
-  currentTrack: Track | null;
-  isTransitioning: boolean;
-  textChannel: TextChannel | null;
-  ffmpegProcess: ReturnType<typeof spawn> | null;
-  disconnectTimer: ReturnType<typeof setTimeout> | null;
-  voiceChannelId: string | null;
-  // Radio mode
-  radioMode: boolean;
-  basePlaylistTrackQueries: string[];
-  // Ducking real: necesitamos saber URL y posición para rearrancar ffmpeg con -ss
-  currentMusicUrl: string | null;
-  trackStartedAt: number; // ms epoch cuando el player entró en Playing
-  commentScheduled: boolean; // 1 comentario con ducking por canción máximo
-  lastDjVoice: number; // índice en PIPER_MODELS de la última voz usada (para alternar el dúo)
-}
+// Track y GuildState ahora viven en ./types (compartidos con los comandos).
 
 // ─── Estado ───────────────────────────────────────────────────────────────────
 const client = new Client({
@@ -419,12 +401,57 @@ interface YtMetadata {
   playlist?: string;
 }
 
+// Palabras que delatan "edits" (versiones alteradas) que NO queremos al pedir el
+// tema original. Solo penalizan si NO están en el query (si pediste un remix, vale).
+const BAD_EDIT_KEYWORDS = [
+  'sped up', 'spedup', 'speed up', 'nightcore', 'slowed', 'reverb',
+  '8d audio', '8d', 'bass boost', 'bassboost', 'tiktok', 'mashup',
+  '1 hour', '1hour', 'one hour', '10 hours', 'karaoke', 'instrumental',
+  'cover', 'remix', 'acapella', 'a capella', 'parody', 'loop',
+];
+
+function scoreYouTubeCandidate(video: any, query: string, rank: number): number {
+  const title = (video.title || '').toLowerCase();
+  const q = query.toLowerCase();
+  let score = -rank * 2; // leve preferencia al orden original de YouTube
+
+  for (const kw of BAD_EDIT_KEYWORDS) {
+    if (title.includes(kw) && !q.includes(kw)) score -= 100; // edit no pedida
+  }
+  if (title.includes('official audio') || title.includes('audio oficial')) score += 30;
+  else if (title.includes('official') || title.includes('oficial')) score += 20;
+  else if (title.includes('audio')) score += 10;
+
+  // Canal tipo artista (VEVO / "Artista - Topic") suele ser la versión correcta.
+  const author = (video.author?.name || '').toLowerCase();
+  const authorBase = author.replace(/\s*-\s*topic$/, '').trim();
+  if (author.includes('vevo') || (authorBase && q.includes(authorBase))) score += 15;
+
+  // Duración: castigar loops/compilaciones largas y clips muy cortos (sped up).
+  const secs = video.seconds || 0;
+  if (secs > 900) score -= 50;
+  if (secs > 0 && secs < 45) score -= 30;
+
+  return score;
+}
+
+// Elige el mejor video del top 10 según el score (filtra edits, prefiere oficial).
+function pickBestVideo(videos: any[], query: string): any {
+  let best = videos[0];
+  let bestScore = -Infinity;
+  videos.slice(0, 10).forEach((v, i) => {
+    const s = scoreYouTubeCandidate(v, query, i);
+    if (s > bestScore) { bestScore = s; best = v; }
+  });
+  return best;
+}
+
 async function searchYouTube(query: string): Promise<Track | null> {
   try {
     const r = await ytSearch(query);
     if (r.videos.length === 0) return null;
 
-    const v = r.videos[0];
+    const v = pickBestVideo(r.videos, query);
     const mins = Math.floor(v.seconds / 60);
     const secs = v.seconds % 60;
 
@@ -516,11 +543,53 @@ function detectarFuente(url: string): 'YouTube' | 'Spotify' | 'SoundCloud' {
 // Android/Termux, donde no hay Piper ni SAPI y solo se quiere música.
 const TTS_DISABLED = process.env.TTS_DISABLED === '1';
 
-// Volumen de la música mientras habla el DJ (0.0 - 1.0). 0.18 = ~18%
-const DUCK_VOLUME = 0.18;
+// Ducking suave: durante el comentario del DJ la música baja a este nivel (0.0-1.0).
+// 0.6 = se escucha la música y la voz a la vez; subilo a ~0.8 para música más fuerte.
+const DUCK_VOLUME = 0.6;
 
 // Serializa los anuncios por guild para evitar que dos TTS se pisen
 const announcementLocks = new Map<string, Promise<void>>();
+
+// ─── Descripción de canción por IA (Gemini) ──────────────────────────────────
+// Genera una descripción corta y real de cada tema. Cacheada por URL para no
+// llamar dos veces el mismo tema. Si no hay key o falla, devuelve null y el
+// llamador cae a las plantillas genéricas.
+const songDescCache = new Map<string, string>();
+let genaiClient: GoogleGenAI | null = null;
+
+async function generateSongDescription(track: Track): Promise<string | null> {
+  if (!GEMINI_API_KEY) return null;
+
+  const cached = songDescCache.get(track.url);
+  if (cached) return cached;
+
+  try {
+    if (!genaiClient) genaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+    const prompt =
+      `Sos el DJ de una radio. En UNA sola frase corta (máximo 22 palabras), ` +
+      `en español neutro-chileno informal y con onda, presentá esta canción con ` +
+      `un dato real e interesante (año, género, de qué trata, o por qué es buena). ` +
+      `No uses comillas, emojis ni hashtags. Si no conocés el tema, hacé una ` +
+      `presentación entusiasta sin inventar datos.\n` +
+      `Canción: "${track.title}"${track.artist ? ` de ${track.artist}` : ''}.`;
+
+    const res = await genaiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: prompt,
+    });
+
+    const text = (res.text || '').trim().replace(/^["']+|["']+$/g, '').replace(/\s+/g, ' ');
+    if (!text) return null;
+
+    songDescCache.set(track.url, text);
+    console.log(`🤖 Descripción IA: "${text.slice(0, 70)}..."`);
+    return text;
+  } catch (err: any) {
+    console.warn(`⚠️  Gemini descripción falló: ${err?.message || err}`);
+    return null;
+  }
+}
 
 type AnnouncementType = 'intro' | 'next' | 'joke' | 'comment';
 
@@ -565,7 +634,13 @@ async function playDjAnnouncement(
   const estado = estados.get(guildId);
   if (!estado || !estado.radioMode) return;
 
-  const texto = buildAnnouncementText(tipo, estado, track);
+  let texto = buildAnnouncementText(tipo, estado, track);
+  // Comentario de inicio: pedimos a la IA una descripción real del tema.
+  // Si no hay key o falla, queda la plantilla genérica de buildAnnouncementText.
+  if (tipo === 'comment' && track) {
+    const desc = await generateSongDescription(track);
+    if (desc) texto = desc;
+  }
   if (!texto) return;
 
   // Lock por guild: anuncios serializados, nunca se pisan
@@ -655,39 +730,7 @@ function escapeSsml(texto: string): string {
     .replace(/'/g, '&apos;');
 }
 
-// Principal: Azure Cognitive Services Speech (REST). Voz neural es-AR, orgánica y estable.
-// Devuelve MP3; el endpoint acepta hasta ~10 min de audio por request, suficiente para el DJ.
-async function generateWithAzure(outFile: string, texto: string): Promise<void> {
-  if (!AZURE_SPEECH_KEY || !AZURE_SPEECH_REGION) {
-    throw new Error('Azure no configurado (AZURE_SPEECH_KEY/AZURE_SPEECH_REGION)');
-  }
-  const lang = AZURE_TTS_VOICE.split('-').slice(0, 2).join('-'); // es-AR-ElenaNeural -> es-AR
-  const ssml =
-    `<speak version='1.0' xml:lang='${lang}'>` +
-    `<voice xml:lang='${lang}' name='${AZURE_TTS_VOICE}'>${escapeSsml(texto)}</voice>` +
-    `</speak>`;
 
-  const res = await fetch(
-    `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`,
-    {
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
-        'User-Agent': 'jsradio',
-      },
-      body: ssml,
-    }
-  );
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`Azure TTS HTTP ${res.status} ${detail.slice(0, 120)}`);
-  }
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length < 200) throw new Error('Azure devolvió audio vacío');
-  await writeFile(outFile, buf);
-}
 
 // Baja un chunk de audio MP3 desde Google Translate TTS.
 async function fetchGoogleTtsChunk(texto: string): Promise<Buffer> {
@@ -714,40 +757,50 @@ async function generateWithGoogle(outFile: string, texto: string): Promise<void>
   await writeFile(outFile, Buffer.concat(buffers));
 }
 
-// Fallback offline: SAPI de Windows (System.Speech). Escribe WAV; ffmpeg lo lee igual.
-// Pasamos texto y script por archivos temporales para evitar el infierno de comillas en PowerShell.
-async function generateWithSapi(outFile: string, texto: string): Promise<void> {
-  const txtFile = outFile.replace(/\.[^.]+$/, '.txt');
-  const ps1File = outFile.replace(/\.[^.]+$/, '.ps1');
-  await writeFile(txtFile, texto, 'utf8');
 
-  const script = [
-    `Add-Type -AssemblyName System.Speech`,
-    `$text = Get-Content -Raw -Encoding UTF8 '${txtFile}'`,
-    `$s = New-Object System.Speech.Synthesis.SpeechSynthesizer`,
-    `try { $s.SelectVoice('${SAPI_VOICE}') } catch {}`,
-    `$s.SetOutputToWaveFile('${outFile}')`,
-    `$s.Speak($text)`,
-    `$s.Dispose()`,
-  ].join('\n');
-  await writeFile(ps1File, script, 'utf8');
 
-  try {
-    await execAsync(
-      `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${ps1File}"`,
-      { timeout: 20000 }
-    );
-  } finally {
-    setTimeout(() => {
-      unlink(txtFile).catch(() => {});
-      unlink(ps1File).catch(() => {});
-    }, 5000);
-  }
+// ─── Gemini TTS
+function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bits = 16): Buffer {
+  const byteRate = (sampleRate * channels * bits) / 8;
+  const blockAlign = (channels * bits) / 8;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bits, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
 }
 
-// Genera un archivo de audio del DJ en cascada: Azure (voz orgánica) → gTTS → SAPI offline.
+async function generateWithGemini(outFile: string, texto: string, voice: string = GEMINI_TTS_VOICE): Promise<void> {
+  if (!GEMINI_API_KEY) throw new Error('sin GEMINI_API_KEY');
+  if (!genaiClient) genaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+  const res = await genaiClient.models.generateContent({
+    model: GEMINI_TTS_MODEL,
+    contents: `Decí esto como locutora de radio chilena, con onda y acento chileno natural: ${texto}`,
+    config: {
+      responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+    } as any,
+  });
+
+  const data = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!data) throw new Error('Gemini TTS sin audio');
+  await writeFile(outFile, pcmToWav(Buffer.from(data, 'base64')));
+}
+
+// Genera un archivo de audio del DJ en cascada: Gemini → Piper → gTTS.
 // El archivo siempre se nombra .mp3 por compatibilidad con el resto del pipeline,
-// pero ffmpeg detecta el formato real por contenido (MP3 de Azure/gTTS o WAV de SAPI).
+// pero ffmpeg detecta el formato real por contenido (MP3 de Gemini/gTTS o WAV de SAPI).
 async function generateTtsMp3(
   guildId: string,
   texto: string,
@@ -756,21 +809,21 @@ async function generateTtsMp3(
 ): Promise<string> {
   const outFile = join(tmpdir(), `jsradio_${guildId}_${Date.now()}.mp3`);
 
-  // 1) Azure Neural (principal) — solo si hay credenciales configuradas.
-  if (AZURE_SPEECH_KEY && AZURE_SPEECH_REGION) {
+  // 1) Gemini TTS (voz femenina chilena) — primaria si hay GEMINI_API_KEY.
+  if (!GEMINI_TTS_DISABLED && GEMINI_API_KEY) {
     for (let i = 0; i < attempts; i++) {
       try {
-        await generateWithAzure(outFile, texto);
+        await generateWithGemini(outFile, texto);
         return outFile;
       } catch (err: any) {
-        console.warn(`⚠️  Azure TTS intento ${i + 1}/${attempts} falló: ${err?.message || err}`);
+        console.warn(`⚠️  Gemini TTS intento ${i + 1}/${attempts} falló: ${err?.message || err}`);
         if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400 * (i + 1)));
       }
     }
-    console.log('🔁 Azure no disponible, cayendo a Piper');
+    console.log('🔁 Gemini TTS no disponible, cayendo a Piper');
   }
 
-  // 2) Piper (neural local, offline e ilimitado) — primario efectivo si está instalado.
+  // 2) Piper (neural local, offline e ilimitado) — funciona sin red ni cuenta.
   if (PIPER_AVAILABLE) {
     try {
       await generateWithPiper(outFile, texto, voiceModel || PIPER_MODEL);
@@ -780,7 +833,7 @@ async function generateTtsMp3(
     }
   }
 
-  // 3) Google Translate TTS (fallback de red).
+  // 3) Google Translate TTS (último recurso, depende de red).
   for (let i = 0; i < attempts; i++) {
     try {
       await generateWithGoogle(outFile, texto);
@@ -791,14 +844,7 @@ async function generateTtsMp3(
     }
   }
 
-  // 4) SAPI offline (último recurso, nunca depende de red).
-  try {
-    console.log('🔁 gTTS no disponible, usando SAPI offline');
-    await generateWithSapi(outFile, texto);
-    return outFile;
-  } catch (err: any) {
-    throw new Error(`TTS falló (Azure + Piper + gTTS + SAPI): ${err?.message || err}`);
-  }
+  throw new Error(`TTS falló en todos los motores (Gemini + Piper + gTTS)`);
 }
 
 // Devuelve la duración (segundos) de un archivo de audio usando ffprobe.
@@ -976,9 +1022,11 @@ async function speakWithDucking(guildId: string, texto: string, voiceModel?: str
       `[bg][voice]amix=inputs=2:duration=first:dropout_transition=0.5:normalize=0`;
 
     const ff = spawn(FFMPEG, [
+      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       '-reconnect', '1',
       '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
+      '-reconnect_on_network_error', '1',
+      '-reconnect_delay_max', '10',
       '-ss', String(elapsed),
       '-i', musicUrl,
       '-i', oggFile,
@@ -1008,7 +1056,14 @@ async function speakWithDucking(guildId: string, texto: string, voiceModel?: str
       console.error(`❌ ffmpeg(duck) error [${guildId}]:`, err.message);
     });
 
-    const resource = createAudioResource(ff.stdout!, { inputType: StreamType.OggOpus });
+    const resource = createAudioResource(ff.stdout!, {
+      inputType: StreamType.OggOpus,
+      inlineVolume: true,
+    });
+    // Tras el ducking re-aplicamos el volumen del guild: si no, el tema vuelve a
+    // sonar al 100% y /volume quedaría apuntando a un resource muerto.
+    estado.currentResource = resource;
+    resource.volume?.setVolume(estado.volume ?? 1.0);
     estado.player.play(resource);
 
     // Mantener trackStartedAt coherente: la música arrancó hace `elapsed` segundos lógicamente.
@@ -1053,60 +1108,37 @@ function buildNowPlayingMessage(track: Track, isRadio: boolean): string {
   return `🎵 **Sonando ahora:** ${track.title} [${track.duration}]${radioTag}`;
 }
 
+// ─── Motor expuesto a los comandos ────────────────────────────────────────────
+// Los archivos de ./commands reciben este objeto vía CommandContext.engine.
+// Centraliza el acceso al estado y a la lógica de audio/búsqueda/TTS sin que los
+// comandos importen bot.ts (evita ciclos de import).
+const engine: Engine = {
+  estados,
+  BOT_NAME,
+  CHISTES,
+  searchYouTube,
+  searchSpotify,
+  searchSoundCloud,
+  resolveSpotifyUrl,
+  getTrackMetadata,
+  detectarFuente,
+  getRadioPlaylistTracks,
+  buildPlayingEmbed,
+  playDjAnnouncement,
+  refillRadioQueue,
+  ensureGuild,
+  playNextFromQueue,
+  killFfmpeg,
+  limpiarEstado,
+};
+
 // ─── Cliente Discord ─────────────────────────────────────────────────────────
 
 client.on('clientReady', async () => {
   console.log(`⚡ ${BOT_NAME} conectado como ${client.user?.tag}`);
 
-  const comandos = [
-    new SlashCommandBuilder()
-      .setName('play')
-      .setDescription('Reproduce música')
-      .addStringOption((opt) =>
-        opt.setName('cancion').setDescription('Nombre del tema o URL').setRequired(true)
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName('fuente')
-          .setDescription('auto, yt, sp o scld')
-          .setRequired(false)
-          .addChoices(
-            { name: 'auto — Spotify, YouTube, SoundCloud', value: 'auto' },
-            { name: 'yt — solo YouTube', value: 'yt' },
-            { name: 'sp — solo Spotify', value: 'sp' },
-            { name: 'scld — solo SoundCloud', value: 'scld' }
-          )
-      ),
-    new SlashCommandBuilder()
-      .setName('radio')
-      .setDescription('Activa o desactiva el modo radio JS RADIO')
-      .addStringOption((opt) =>
-        opt.setName('accion').setDescription('on, off o joke').setRequired(false)
-          .addChoices(
-            { name: 'on — activa el DJ', value: 'on' },
-            { name: 'off — desactiva el DJ', value: 'off' },
-            { name: 'joke — chiste del DJ', value: 'joke' }
-          )
-      ),
-    new SlashCommandBuilder()
-      .setName('skip')
-      .setDescription('Salta al siguiente tema'),
-    new SlashCommandBuilder()
-      .setName('stop')
-      .setDescription('Detiene la música y desconecta el bot'),
-    new SlashCommandBuilder()
-      .setName('queue')
-      .setDescription('Muestra los temas en cola'),
-    new SlashCommandBuilder()
-      .setName('nowplaying')
-      .setDescription('Muestra el tema que está sonando ahora'),
-    new SlashCommandBuilder()
-      .setName('help')
-      .setDescription('Muestra todos los comandos disponibles'),
-  ];
-
-  await client.application?.commands.set(comandos.map((c) => c.toJSON()));
-  console.log(`✅ Comandos slash registrados`);
+  await client.application?.commands.set(commands.map((c) => c.data.toJSON()));
+  console.log(`✅ ${commands.length} comandos slash registrados`);
 });
 
 // ─── Auto-desconectar si no hay nadie ─────────────────────────────────────────
@@ -1157,8 +1189,10 @@ client.on('interactionCreate', async (interaction) => {
     const member = interaction.member as GuildMember;
     const voiceChannel = member.voice?.channel;
 
-    const necesitaVoz = ['play', 'skip', 'stop', 'radio'];
-    if (necesitaVoz.includes(commandName) && !voiceChannel) {
+    const command = commandMap.get(commandName);
+    if (!command) return;
+
+    if (command.needsVoice && !voiceChannel) {
       await interaction.reply({
         content: '❌ Tenés que estar en un canal de voz para usar este comando.',
         ephemeral: true,
@@ -1166,31 +1200,13 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    const guildState = estados.get(guildId);
-
-    switch (commandName) {
-      case 'play':
-        await handlePlay(interaction, guildId, member);
-        break;
-      case 'radio':
-        await handleRadio(interaction, guildId, member, guildState);
-        break;
-      case 'skip':
-        await handleSkip(interaction, guildId, guildState);
-        break;
-      case 'stop':
-        await handleStop(interaction, guildId, guildState);
-        break;
-      case 'queue':
-        await handleQueue(interaction, guildState);
-        break;
-      case 'nowplaying':
-        await handleNowPlaying(interaction, guildState);
-        break;
-      case 'help':
-        await handleHelp(interaction);
-        break;
-    }
+    await command.execute({
+      interaction,
+      guildId,
+      member,
+      state: estados.get(guildId),
+      engine,
+    });
   } catch (err: any) {
     console.error('❌ Error en interactionCreate:', err);
     try {
@@ -1207,365 +1223,68 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ─── Comando /play ────────────────────────────────────────────────────────────
-
-async function handlePlay(
-  interaction: ChatInputCommandInteraction,
+// ─── Crear/obtener estado del guild ───────────────────────────────────────────
+// Los comandos (en ./commands) no arman GuildState a mano: delegan acá para que
+// la forma del estado y los listeners del player vivan en un solo lugar.
+async function ensureGuild(
   guildId: string,
-  member: GuildMember
-) {
-  await interaction.deferReply();
-  const query = interaction.options.getString('cancion', true);
-  const fuente = interaction.options.getString('fuente') || 'auto';
-  const voiceChannel = member.voice?.channel!;
-  const textChannel = interaction.channel as TextChannel;
+  voiceChannel: VoiceBasedChannel,
+  textChannel: TextChannel
+): Promise<GuildState> {
+  let estado = estados.get(guildId);
 
-  try {
-    const esUrl = /^https?:\/\//.test(query);
-    let tracksToQueue: { track: Track; fuenteHallazgo: string }[] = [];
+  if (!estado) {
+    console.log(`🔊 Conectando a canal de voz: ${voiceChannel.name} [${voiceChannel.id}]`);
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    });
 
-    if (esUrl) {
-      const urlFuente = detectarFuente(query);
+    const player = createAudioPlayer();
+    connection.subscribe(player);
 
-      if (urlFuente === 'Spotify') {
-        const info = await resolveSpotifyUrl(query);
-        if (info && info.tracks.length > 0) {
-          for (const t of info.tracks) {
-            const ytQuery = `${t.artist} - ${t.name}`;
-            const ytTrack = await searchYouTube(ytQuery);
-            if (ytTrack) {
-              tracksToQueue.push({
-                track: { ...ytTrack, source: 'Spotify' },
-                fuenteHallazgo: info.isPlaylist
-                  ? `Spotify Playlist → YouTube (${t.name})`
-                  : `Spotify → YouTube (${t.name} — ${t.artist})`,
-              });
-            }
-          }
-        }
-      } else if (urlFuente === 'SoundCloud') {
-        const scTrack = await searchSoundCloud(query);
-        if (scTrack) {
-          tracksToQueue.push({
-            track: scTrack,
-            fuenteHallazgo: 'SoundCloud (URL directa)',
-          });
-        }
-      } else {
-        // YouTube URL: obtener metadata completa
-        const meta = await getTrackMetadata(query);
-        tracksToQueue.push({
-          track: {
-            title: meta?.title || query,
-            url: query,
-            duration: meta?.duration || '?',
-            source: 'YouTube',
-            thumbnail: meta?.thumbnail,
-            artist: meta?.artist,
-          },
-          fuenteHallazgo: 'YouTube (URL directa)',
-        });
-      }
-    } else {
-      // Búsqueda por texto
-      if (fuente === 'yt') {
-        const track = await searchYouTube(query);
-        if (track) tracksToQueue.push({ track, fuenteHallazgo: 'YouTube' });
-      } else if (fuente === 'sp') {
-        const s = await searchSpotify(query);
-        if (s) {
-          const yt = await searchYouTube(`${s.artist} - ${s.name}`);
-          if (yt) {
-            tracksToQueue.push({
-              track: { ...yt, source: 'Spotify' },
-              fuenteHallazgo: `Spotify → YouTube (${s.name} — ${s.artist})`,
-            });
-          }
-        }
-      } else if (fuente === 'scld') {
-        const track = await searchSoundCloud(query);
-        if (track) tracksToQueue.push({ track, fuenteHallazgo: 'SoundCloud' });
-      } else {
-        // auto: 3 fuentes en paralelo
-        const [spotify, ytResult, scResult] = await Promise.all([
-          searchSpotify(query).then(async (s) => {
-            if (!s) return null;
-            const yt = await searchYouTube(`${s.artist} - ${s.name}`);
-            if (!yt) return null;
-            return { track: { ...yt, source: 'Spotify' as const }, fuente: `Spotify → YouTube (${s.name} — ${s.artist})` };
-          }),
-          searchYouTube(query).then((yt) => {
-            if (!yt) return null;
-            return { track: yt, fuente: 'YouTube' };
-          }),
-          searchSoundCloud(query).then((sc) => {
-            if (!sc) return null;
-            return { track: sc, fuente: 'SoundCloud' };
-          }),
-        ]);
-        const ganador = spotify || ytResult || scResult;
-        if (ganador) tracksToQueue.push({ track: ganador.track, fuenteHallazgo: ganador.fuente });
-      }
-    }
+    const playlistTracks = await getRadioPlaylistTracks();
 
-    if (tracksToQueue.length === 0) {
-      await interaction.editReply(`❌ No encontré "${query}" en ninguna plataforma.`);
-      return;
-    }
+    estado = {
+      player,
+      connection,
+      queue: [],
+      currentTrack: null,
+      isTransitioning: false,
+      textChannel,
+      ffmpegProcess: null,
+      disconnectTimer: null,
+      voiceChannelId: voiceChannel.id,
+      radioMode: false,
+      basePlaylistTrackQueries: playlistTracks,
+      currentMusicUrl: null,
+      trackStartedAt: 0,
+      commentScheduled: false,
+      lastDjVoice: 0,
+      // Controles nuevos
+      volume: 1.0,
+      loopMode: 'off',
+      currentResource: null,
+      skipRequested: false,
+      seedTrack: null,
+    };
+    estados.set(guildId, estado);
 
-    // ── Obtener o crear estado del guild ───────────────────────────────
-    let estado = estados.get(guildId);
-
-    if (!estado) {
-      console.log(`🔊 Conectando a canal de voz: ${voiceChannel.name} [${voiceChannel.id}]`);
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: voiceChannel.guild.id,
-        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      });
-
-      const player = createAudioPlayer();
-      connection.subscribe(player);
-
-      const playlistTracks = await getRadioPlaylistTracks();
-
-      estado = {
-        player,
-        connection,
-        queue: [],
-        currentTrack: null,
-        isTransitioning: false,
-        textChannel,
-        ffmpegProcess: null,
-        disconnectTimer: null,
-        voiceChannelId: voiceChannel.id,
-        radioMode: false,
-        basePlaylistTrackQueries: playlistTracks,
-        currentMusicUrl: null,
-        trackStartedAt: 0,
-        commentScheduled: false,
-        lastDjVoice: 0,
-      };
-      estados.set(guildId, estado);
-
-      player.on(AudioPlayerStatus.Idle, () => {
-        const e = estados.get(guildId);
-        if (!e) return;
-        onTrackEnd(guildId);
-      });
-      player.on('error', (err) => {
-        console.error(`❌ Error en player [${guildId}]:`, err.message);
-        onTrackEnd(guildId);
-      });
-    } else {
-      estado.textChannel = textChannel;
-    }
-
-    // Agregar tracks a la cola
-    const firstTrack = tracksToQueue[0].track;
-    const newTracks = tracksToQueue.map((t) => t.track);
-
-    if (estado.radioMode && estado.currentTrack) {
-      // En modo radio, los pedidos del usuario van JUSTO DESPUÉS de la actual,
-      // por encima de los temas auto-rellenados de la playlist base.
-      // queue[0] es la track actual sonando; insertamos en queue[1].
-      const insertAt = estado.queue[0] === estado.currentTrack ? 1 : 0;
-      estado.queue.splice(insertAt, 0, ...newTracks);
-    } else {
-      estado.queue.push(...newTracks);
-    }
-
-    if (estado.currentTrack === null && !estado.isTransitioning) {
-      await playNextFromQueue(guildId);
-    }
-
-    // Mensaje de confirmación con embed
-    const embed = buildPlayingEmbed(firstTrack, estado.radioMode);
-
-    if (tracksToQueue.length === 1) {
-      await interaction.editReply({
-        content: `🎵 **${BOT_NAME}** — ${tracksToQueue[0].fuenteHallazgo}`,
-        embeds: [embed],
-      });
-    } else {
-      await interaction.editReply({
-        content: `🎵 **${BOT_NAME}**: "${firstTrack.title}" + ${tracksToQueue.length - 1} temas más agregados a la cola.`,
-        embeds: [embed],
-      });
-    }
-  } catch (err: any) {
-    console.error('Error en /play:', err);
-    await interaction.editReply(`❌ Error al reproducir: ${err.message || 'Error desconocido'}`);
-  }
-}
-
-// ─── Comando /radio ───────────────────────────────────────────────────────────
-
-async function handleRadio(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  member: GuildMember,
-  guildState: GuildState | undefined
-) {
-  await interaction.deferReply();
-  const accion = interaction.options.getString('accion') || 'toggle';
-
-  if (accion === 'joke') {
-    const chiste = CHISTES[Math.floor(Math.random() * CHISTES.length)];
-    if (guildState?.textChannel) {
-      guildState.textChannel.send(`🎙️ **JS RADIO DJ:** ${chiste}`).catch(() => {});
-      // También reproducir como audio
-      playDjAnnouncement(guildId, 'joke');
-    }
-    await interaction.editReply(`🎙️ DJ dice: "${chiste}"`);
-    return;
-  }
-
-  let nuevoEstado = true;
-
-  if (accion === 'off') {
-    nuevoEstado = false;
-  } else if (accion === 'on') {
-    nuevoEstado = true;
-  } else {
-    nuevoEstado = !guildState?.radioMode;
-  }
-
-  if (!guildState) {
-    await interaction.editReply(
-      '❌ Primero usá `/play` para conectar el bot a un canal de voz.'
-    );
-    return;
-  }
-
-  guildState.radioMode = nuevoEstado;
-
-  if (nuevoEstado) {
-    guildState.basePlaylistTrackQueries = await getRadioPlaylistTracks();
-
-    if (guildState.textChannel) {
-      await guildState.textChannel.send({
-        content: `🔥 **JS RADIO — Modo Radio ACTIVADO** 🔥\n` +
-                 `🎙️ El DJ está en la casa! Bass Arena mode: ON\n` +
-                 `🎵 La mejor música sin parar.\n` +
-                 `📢 Usá \`/radio joke\` para un chiste del DJ.`,
-      });
-    }
-
-    // DJ intro
-    setTimeout(() => playDjAnnouncement(guildId, 'intro'), 2000);
-
-    await interaction.editReply({
-      content: `🔥 **JS RADIO modo radio: ON**\n` +
-               `🎙️ El DJ te va a acompañar cada tema con anuncios y más.`,
+    player.on(AudioPlayerStatus.Idle, () => {
+      const e = estados.get(guildId);
+      if (!e) return;
+      onTrackEnd(guildId);
+    });
+    player.on('error', (err) => {
+      console.error(`❌ Error en player [${guildId}]:`, err.message);
+      onTrackEnd(guildId);
     });
   } else {
-    if (guildState.textChannel) {
-      await guildState.textChannel.send({
-        content: `🔇 **JS RADIO — Modo Radio DESACTIVADO**\n` +
-                 `🎙️ El DJ se va a tomar un break. Siguiente tema: sin anuncios.`,
-      });
-    }
-    await interaction.editReply(`🔇 **JS RADIO modo radio: OFF**`);
-  }
-}
-
-// ─── Comando /skip ────────────────────────────────────────────────────────────
-
-async function handleSkip(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || !guildState.currentTrack) {
-    await interaction.reply('❌ No está sonando nada para saltar.');
-    return;
+    estado.textChannel = textChannel;
   }
 
-  killFfmpeg(guildState);
-  guildState.player.stop();
-  await interaction.reply(`⏭️ Salté "${guildState.currentTrack.title}".`);
-}
-
-// ─── Comando /stop ────────────────────────────────────────────────────────────
-
-async function handleStop(
-  interaction: ChatInputCommandInteraction,
-  guildId: string,
-  guildState: GuildState | undefined
-) {
-  if (!guildState) {
-    await interaction.reply('❌ El bot no está conectado a ningún canal.');
-    return;
-  }
-
-  limpiarEstado(guildId);
-  await interaction.reply(`🛑 **${BOT_NAME}** se desconectó. Nos escuchamos.`);
-}
-
-// ─── Comando /queue ───────────────────────────────────────────────────────────
-
-async function handleQueue(
-  interaction: ChatInputCommandInteraction,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || guildState.queue.length === 0) {
-    await interaction.reply('📭 La cola está vacía. Usá `/play` para agregar temas.');
-    return;
-  }
-
-  const canciones = guildState.queue
-    .map((t, i) => `**${i + 1}.** ${t.title} [${t.duration}] — ${t.source}`)
-    .join('\n');
-
-  const modoRadio = guildState.radioMode ? '\n\n🔥 **Modo Radio: ON** (el DJ te acompaña!)' : '';
-
-  await interaction.reply({
-    content: `📋 **Cola de reproducción:**\n${canciones}${modoRadio}`,
-  });
-}
-
-// ─── Comando /nowplaying ──────────────────────────────────────────────────────
-
-async function handleNowPlaying(
-  interaction: ChatInputCommandInteraction,
-  guildState: GuildState | undefined
-) {
-  if (!guildState || !guildState.currentTrack) {
-    await interaction.reply('❌ No está sonando nada ahora.');
-    return;
-  }
-
-  const track = guildState.currentTrack;
-  const embed = buildPlayingEmbed(track, guildState.radioMode);
-
-  await interaction.reply({ embeds: [embed] });
-}
-
-// ─── Comando /help ─────────────────────────────────────────────────────────────
-
-async function handleHelp(interaction: ChatInputCommandInteraction) {
-  const msg = [
-    `**${BOT_NAME} — Comandos**`,
-    '',
-    '🎵 **/play** `cancion:` [título/URL] `fuente:` auto|yt|sp|scld',
-    '   › *auto*: busca en Spotify→YouTube, YouTube y SoundCloud',
-    '   › *yt*: solo YouTube',
-    '   › *sp*: solo Spotify → YouTube',
-    '   › *scld*: solo SoundCloud',
-    '🔥 **/radio** `accion:` on|off|joke|toggle',
-    '   › *on*: activa el modo radio con DJ',
-    '   › *off*: desactiva el modo radio',
-    '   › *joke*: el DJ cuenta un chiste ahora',
-    '   › *toggle*: activa/desactiva (sin argumentos)',
-    '⏭️ **/skip** — salta al siguiente tema',
-    '🛑 **/stop** — detiene la música y desconecta el bot',
-    '📋 **/queue** — muestra los temas en cola',
-    '🎶 **/nowplaying** — muestra el tema actual con embed',
-    '❓ **/help** — muestra esta ayuda',
-  ].join('\n');
-
-  await interaction.reply({ content: msg, ephemeral: true });
+  return estado;
 }
 
 // ─── Lógica de reproducción ───────────────────────────────────────────────────
@@ -1655,9 +1374,13 @@ function spawnFfmpeg(musicUrl: string) {
   // - `-application audio` + `-vbr on` + `-compression_level 10` = mejor calidad música a igual bitrate
   // - 160k es el sweet spot Opus para música; Discord no recomprime más allá del bitrate del canal
   return spawn(FFMPEG, [
+    // User-Agent de navegador: YouTube resetea (WSAECONNRESET / -10054) conexiones
+    // que no parecen un browser. Con esto baja mucho el throttling del CDN.
+    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
+    '-reconnect_on_network_error', '1',
+    '-reconnect_delay_max', '10',
     '-i', musicUrl,
     '-c:a', 'libopus',
     '-b:a', '160k',
@@ -1674,15 +1397,131 @@ function spawnFfmpeg(musicUrl: string) {
 
 // ─── Auto-cola en modo radio ─────────────────────────────────────────────────
 
+// ─── Radio sembrada: temas parecidos al seed ──────────────────────────────────
+
+function formatDuration(raw?: string): string {
+  const s = parseInt(raw || '', 10);
+  if (!Number.isFinite(s) || s <= 0) return '?';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function extractYouTubeId(url: string): string | null {
+  const m = url.match(/(?:v=|youtu\.be\/|\/watch\?.*v=)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+async function resolveYouTubeVideoId(seed: Track): Promise<string | null> {
+  const direct = extractYouTubeId(seed.url);
+  if (direct) return direct;
+  // Seed no-YouTube (Spotify/SoundCloud): lo buscamos en YouTube para tener videoId.
+  const q = seed.artist ? `${seed.artist} - ${seed.title}` : seed.title;
+  const yt = await searchYouTube(q);
+  return yt ? extractYouTubeId(yt.url) : null;
+}
+
+// Cascada: Spotify Recommendations (elección del usuario) → fallback YouTube Mix.
+// Spotify deprecó /v1/recommendations (27-nov-2024) para apps sin acceso extendido;
+// si responde 404/vacío caemos solo a YouTube Mix (radio RD<videoId> vía yt-dlp).
+async function getSimilarTracks(seed: Track): Promise<Track[]> {
+  // 1) Spotify Recommendations
+  try {
+    const token = await getSpotifyToken();
+    if (token) {
+      const sp = await searchSpotify(seed.artist ? `${seed.artist} - ${seed.title}` : seed.title);
+      if (sp) {
+        const res = await fetch(
+          `https://api.spotify.com/v1/recommendations?seed_tracks=${sp.id}&limit=10`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.ok) {
+          const data: any = await res.json();
+          const recs: any[] = data.tracks || [];
+          const tracks: Track[] = [];
+          for (const r of recs) {
+            const yt = await searchYouTube(`${r.artists?.[0]?.name || ''} - ${r.name}`);
+            if (yt) tracks.push({ ...yt, source: 'Spotify' });
+          }
+          if (tracks.length > 0) {
+            console.log(`🎯 Similares vía Spotify Recommendations: ${tracks.length}`);
+            return tracks;
+          }
+        } else {
+          console.warn(`⚠️ Spotify Recommendations no disponible (HTTP ${res.status}); uso YouTube Mix.`);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ Spotify Recommendations falló: ${err.message}; uso YouTube Mix.`);
+  }
+
+  // 2) Fallback: YouTube Mix (radio RD<videoId>)
+  try {
+    const videoId = await resolveYouTubeVideoId(seed);
+    if (!videoId) return [];
+    // id y duration primero (sin tabs); el título va último porque puede contener tabs.
+    const { stdout } = await execAsync(
+      `"${YTDLP}" --flat-playlist --no-warnings --print "%(id)s\t%(duration)s\t%(title)s" "https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}"`,
+      { timeout: 30000 }
+    );
+    const lines = stdout.trim().split('\n').filter((l: string) => l.trim().length > 0);
+    const tracks: Track[] = [];
+    for (const line of lines.slice(0, 12)) {
+      const tab1 = line.indexOf('\t');
+      const tab2 = line.indexOf('\t', tab1 + 1);
+      if (tab1 === -1 || tab2 === -1) continue;
+      const id = line.slice(0, tab1);
+      const dur = line.slice(tab1 + 1, tab2);
+      const title = line.slice(tab2 + 1);
+      if (!id) continue;
+      // El primer item del mix suele ser el seed mismo → lo saltamos.
+      if (id === videoId) continue;
+      tracks.push({
+        title: title || 'Tema',
+        url: `https://www.youtube.com/watch?v=${id}`,
+        duration: formatDuration(dur),
+        source: 'YouTube',
+      });
+    }
+    if (tracks.length > 0) console.log(`🎯 Similares vía YouTube Mix: ${tracks.length}`);
+    return tracks;
+  } catch (err: any) {
+    console.warn(`⚠️ YouTube Mix falló: ${err.message}`);
+    return [];
+  }
+}
+
 async function refillRadioQueue(guildId: string) {
   const estado = estados.get(guildId);
   if (!estado) return;
 
+  let added = 0;
+
+  // Radio sembrada: si hay un tema semilla, rellenamos con PARECIDOS a ese tema.
+  if (estado.seedTrack) {
+    const similares = await getSimilarTracks(estado.seedTrack);
+    for (const track of similares) {
+      if (estado.queue.length >= 10) break;
+      if (!estado.queue.find((t) => t.url === track.url)) {
+        estado.queue.push(track);
+        added++;
+      }
+    }
+    if (added > 0) {
+      console.log(`📻 Auto-rellenado (sembrado): ${added} tracks [${guildId}]`);
+      return;
+    }
+    // Si no salieron similares, caemos a la playlist base de abajo.
+  }
+
+  // Fallback final: playlist hardcodeada (comportamiento original).
   const baseTracks = estado.basePlaylistTrackQueries;
   if (baseTracks.length === 0) return;
 
-  const shuffled = baseTracks.sort(() => Math.random() - 0.5);
-  let added = 0;
+  // Copia antes de mezclar: .sort() muta in-place y baseTracks es estado persistente
+  // (compartido entre rellenos), no se debe reordenar la fuente original.
+  const shuffled = [...baseTracks].sort(() => Math.random() - 0.5);
 
   for (const query of shuffled.slice(0, 5)) {
     if (estado.queue.length >= 10) break;
@@ -1750,8 +1589,12 @@ async function playCurrentTrack(guildId: string): Promise<void> {
 
     const resource = createAudioResource(ff.stdout!, {
       inputType: StreamType.OggOpus,
-      inlineVolume: false,
+      inlineVolume: true,
     });
+    // Guardamos el resource y aplicamos el volumen del guild para que /volume
+    // pueda ajustarlo en vivo y el nivel persista entre temas.
+    estado.currentResource = resource;
+    resource.volume?.setVolume(estado.volume ?? 1.0);
 
     // Logging de transiciones de estado del player para diagnosticar dónde muere
     estado.player.removeAllListeners('stateChange');
@@ -1771,9 +1614,9 @@ async function playCurrentTrack(guildId: string): Promise<void> {
       estado.textChannel.send({ content: msg, embeds: [embed] }).catch(() => {});
     }
 
-    // DJ: comentario contextual con ducking en mitad de la canción (1 por canción, 50% chance).
-    // No usa setTimeout encadenado a la canción — se programa una sola vez al arrancar.
-    if (estado.radioMode && !estado.commentScheduled && Math.random() < 0.5) {
+    // DJ: descripción corta del tema al INICIO, con ducking suave (se escucha música + voz).
+    // Una sola vez por canción, siempre que esté en modo radio.
+    if (estado.radioMode && !estado.commentScheduled) {
       estado.commentScheduled = true;
       const trackSnapshot = track;
       setTimeout(() => {
@@ -1782,7 +1625,7 @@ async function playCurrentTrack(guildId: string): Promise<void> {
         if (e && e.radioMode && e.currentTrack?.url === trackSnapshot.url) {
           playDjAnnouncement(guildId, 'comment', trackSnapshot).catch(() => {});
         }
-      }, 25000); // ~25s adentro de la canción
+      }, 3000); // ~3s después de arrancar la canción
     }
 
     console.log(`▶️ Sonando: ${track.title} en ${guildId}`);
@@ -1800,10 +1643,27 @@ async function onTrackEnd(guildId: string) {
 
   if (estado.isTransitioning) return;
 
-  // Sacar la track actual de la queue
+  // ── Loop ────────────────────────────────────────────────────────────────────
+  // El modo radio tiene prioridad: el auto-relleno manda y el loop se ignora.
+  const skipForzado = estado.skipRequested;
+  estado.skipRequested = false;
+
+  // loop=track: repetir el mismo tema, salvo que el fin haya sido un /skip manual.
+  if (estado.loopMode === 'track' && !skipForzado && !estado.radioMode && estado.currentTrack) {
+    await playCurrentTrack(guildId);
+    return;
+  }
+
+  // Sacar la track actual de la queue (o rotarla al final si loop=queue)
   if (estado.currentTrack) {
     const idx = estado.queue.findIndex((t) => t.url === estado.currentTrack!.url);
-    if (idx !== -1) estado.queue.splice(idx, 1);
+    if (idx !== -1) {
+      const [terminado] = estado.queue.splice(idx, 1);
+      // loop=queue: el tema terminado vuelve al final para repetir la cola entera.
+      if (estado.loopMode === 'queue' && !estado.radioMode && terminado) {
+        estado.queue.push(terminado);
+      }
+    }
   }
 
   estado.currentTrack = null;

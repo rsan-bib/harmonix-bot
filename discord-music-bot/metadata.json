@@ -1,0 +1,6 @@
+{
+  "name": "Discord Music Bot Hub",
+  "description": "An interactive Discord Music Bot workspace, featuring a real-time command terminal, browser stream player with sound visualization, smart Gemini music recommendation/lyric syncing, and complete source code configuration for local Discord hosting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
