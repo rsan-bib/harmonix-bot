@@ -26,6 +26,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { writeFile, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
+import { GoogleGenAI } from '@google/genai';
 
 // Tipos de dominio + contrato del motor (compartidos con los comandos).
 import type { Track, GuildState, Engine } from './types';
@@ -46,26 +47,31 @@ const FFPROBE = process.env.FFPROBE || (IS_WIN ? 'C:\\Users\\Roko\\ffmpeg\\ffpro
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
 const RADIO_PLAYLIST_ID = '5HoC05C0PLSxNlxiJ3QABu';
-// TTS en cascada: Azure Neural (principal, voz orgánica es-CL) → Google Translate TTS → SAPI offline.
-// Azure necesita AZURE_SPEECH_KEY + AZURE_SPEECH_REGION en .env; si faltan, arranca directo en gTTS.
-// El endpoint WSS gratuito de Edge TTS quedó devolviendo 403 server-side, por eso ya no se usa.
-// Voces chilenas: es-CL-CatalinaNeural (femenina) o es-CL-LorenzoNeural (masculina).
-const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY || '';
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION || '';
-const AZURE_TTS_VOICE = process.env.AZURE_TTS_VOICE || 'es-CL-CatalinaNeural';
-// Piper: TTS neural LOCAL (offline, gratis, ilimitado, sin cuenta). Motor principal efectivo.
-// Voz por defecto: es_MX (mexicano neutro, no argentino). Override de rutas/voz via .env.
+// ─── TTS Config ────────────────────────────────────────────────────────────────
+// Lenguaje para gTTS (fallback de red).
+const TTS_LANG = process.env.TTS_LANG || 'es';
+
+// Piper: TTS neural LOCAL (offline, gratis, ilimitado, sin cuenta).
+// Voz por defecto: es_AR (Daniela, argentino). Override de rutas/voz via .env.
 const PIPER_EXE = process.env.PIPER_EXE || 'C:\\Users\\Roko\\piper\\piper\\piper.exe';
-const PIPER_MODEL = process.env.PIPER_MODEL || 'C:\\Users\\Roko\\piper\\models\\es_MX-claude-high.onnx';
+const PIPER_MODEL = process.env.PIPER_MODEL || 'C:\\Users\\Roko\\piper\\models\\es_AR-daniela-high.onnx';
 // Segundo comentador (dúo): voz distinta. Si existe, se habilita el modo dúo.
 const PIPER_MODEL_2 = process.env.PIPER_MODEL_2 || 'C:\\Users\\Roko\\piper\\models\\es_MX-ald-medium.onnx';
 const PIPER_AVAILABLE = existsSync(PIPER_EXE) && existsSync(PIPER_MODEL);
 // Lista de voces de DJ disponibles (1 o 2). Con 2 se activan diálogos y turnos entre comentadores.
 const PIPER_MODELS = [PIPER_MODEL, PIPER_MODEL_2].filter((m) => existsSync(m));
-const DUO_ENABLED = PIPER_AVAILABLE && PIPER_MODELS.length >= 2;
-// Override via .env: TTS_LANG=es (es, es-419, etc.) y SAPI_VOICE='Microsoft Sabina Desktop'.
-const TTS_LANG = process.env.TTS_LANG || 'es';
-const SAPI_VOICE = process.env.SAPI_VOICE || 'Microsoft Sabina Desktop';
+// Dúo (dos voces alternando) DESACTIVADO por defecto: el DJ habla con una sola voz.
+// Se puede reactivar con DJ_DUO=1 en el .env.
+const DUO_ENABLED = PIPER_AVAILABLE && PIPER_MODELS.length >= 2 && process.env.DJ_DUO === '1';
+
+// Gemini: descripciones cortas reales de cada canción + TTS (key gratis en ai.google.dev).
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+// Gemini TTS: voz femenina chilena (misma key gratis).
+// Voces femeninas disponibles: Kore, Leda, Aoede, Zephyr, Autonoe, Callirrhoe.
+const GEMINI_TTS_DISABLED = process.env.GEMINI_TTS_DISABLED === '1';
+const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+const GEMINI_TTS_VOICE = process.env.GEMINI_TTS_VOICE || 'Kore';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 // Track y GuildState ahora viven en ./types (compartidos con los comandos).
@@ -395,12 +401,57 @@ interface YtMetadata {
   playlist?: string;
 }
 
+// Palabras que delatan "edits" (versiones alteradas) que NO queremos al pedir el
+// tema original. Solo penalizan si NO están en el query (si pediste un remix, vale).
+const BAD_EDIT_KEYWORDS = [
+  'sped up', 'spedup', 'speed up', 'nightcore', 'slowed', 'reverb',
+  '8d audio', '8d', 'bass boost', 'bassboost', 'tiktok', 'mashup',
+  '1 hour', '1hour', 'one hour', '10 hours', 'karaoke', 'instrumental',
+  'cover', 'remix', 'acapella', 'a capella', 'parody', 'loop',
+];
+
+function scoreYouTubeCandidate(video: any, query: string, rank: number): number {
+  const title = (video.title || '').toLowerCase();
+  const q = query.toLowerCase();
+  let score = -rank * 2; // leve preferencia al orden original de YouTube
+
+  for (const kw of BAD_EDIT_KEYWORDS) {
+    if (title.includes(kw) && !q.includes(kw)) score -= 100; // edit no pedida
+  }
+  if (title.includes('official audio') || title.includes('audio oficial')) score += 30;
+  else if (title.includes('official') || title.includes('oficial')) score += 20;
+  else if (title.includes('audio')) score += 10;
+
+  // Canal tipo artista (VEVO / "Artista - Topic") suele ser la versión correcta.
+  const author = (video.author?.name || '').toLowerCase();
+  const authorBase = author.replace(/\s*-\s*topic$/, '').trim();
+  if (author.includes('vevo') || (authorBase && q.includes(authorBase))) score += 15;
+
+  // Duración: castigar loops/compilaciones largas y clips muy cortos (sped up).
+  const secs = video.seconds || 0;
+  if (secs > 900) score -= 50;
+  if (secs > 0 && secs < 45) score -= 30;
+
+  return score;
+}
+
+// Elige el mejor video del top 10 según el score (filtra edits, prefiere oficial).
+function pickBestVideo(videos: any[], query: string): any {
+  let best = videos[0];
+  let bestScore = -Infinity;
+  videos.slice(0, 10).forEach((v, i) => {
+    const s = scoreYouTubeCandidate(v, query, i);
+    if (s > bestScore) { bestScore = s; best = v; }
+  });
+  return best;
+}
+
 async function searchYouTube(query: string): Promise<Track | null> {
   try {
     const r = await ytSearch(query);
     if (r.videos.length === 0) return null;
 
-    const v = r.videos[0];
+    const v = pickBestVideo(r.videos, query);
     const mins = Math.floor(v.seconds / 60);
     const secs = v.seconds % 60;
 
@@ -492,11 +543,53 @@ function detectarFuente(url: string): 'YouTube' | 'Spotify' | 'SoundCloud' {
 // Android/Termux, donde no hay Piper ni SAPI y solo se quiere música.
 const TTS_DISABLED = process.env.TTS_DISABLED === '1';
 
-// Volumen de la música mientras habla el DJ (0.0 - 1.0). 0.18 = ~18%
-const DUCK_VOLUME = 0.18;
+// Ducking suave: durante el comentario del DJ la música baja a este nivel (0.0-1.0).
+// 0.6 = se escucha la música y la voz a la vez; subilo a ~0.8 para música más fuerte.
+const DUCK_VOLUME = 0.6;
 
 // Serializa los anuncios por guild para evitar que dos TTS se pisen
 const announcementLocks = new Map<string, Promise<void>>();
+
+// ─── Descripción de canción por IA (Gemini) ──────────────────────────────────
+// Genera una descripción corta y real de cada tema. Cacheada por URL para no
+// llamar dos veces el mismo tema. Si no hay key o falla, devuelve null y el
+// llamador cae a las plantillas genéricas.
+const songDescCache = new Map<string, string>();
+let genaiClient: GoogleGenAI | null = null;
+
+async function generateSongDescription(track: Track): Promise<string | null> {
+  if (!GEMINI_API_KEY) return null;
+
+  const cached = songDescCache.get(track.url);
+  if (cached) return cached;
+
+  try {
+    if (!genaiClient) genaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+    const prompt =
+      `Sos el DJ de una radio. En UNA sola frase corta (máximo 22 palabras), ` +
+      `en español neutro-chileno informal y con onda, presentá esta canción con ` +
+      `un dato real e interesante (año, género, de qué trata, o por qué es buena). ` +
+      `No uses comillas, emojis ni hashtags. Si no conocés el tema, hacé una ` +
+      `presentación entusiasta sin inventar datos.\n` +
+      `Canción: "${track.title}"${track.artist ? ` de ${track.artist}` : ''}.`;
+
+    const res = await genaiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: prompt,
+    });
+
+    const text = (res.text || '').trim().replace(/^["']+|["']+$/g, '').replace(/\s+/g, ' ');
+    if (!text) return null;
+
+    songDescCache.set(track.url, text);
+    console.log(`🤖 Descripción IA: "${text.slice(0, 70)}..."`);
+    return text;
+  } catch (err: any) {
+    console.warn(`⚠️  Gemini descripción falló: ${err?.message || err}`);
+    return null;
+  }
+}
 
 type AnnouncementType = 'intro' | 'next' | 'joke' | 'comment';
 
@@ -541,7 +634,13 @@ async function playDjAnnouncement(
   const estado = estados.get(guildId);
   if (!estado || !estado.radioMode) return;
 
-  const texto = buildAnnouncementText(tipo, estado, track);
+  let texto = buildAnnouncementText(tipo, estado, track);
+  // Comentario de inicio: pedimos a la IA una descripción real del tema.
+  // Si no hay key o falla, queda la plantilla genérica de buildAnnouncementText.
+  if (tipo === 'comment' && track) {
+    const desc = await generateSongDescription(track);
+    if (desc) texto = desc;
+  }
   if (!texto) return;
 
   // Lock por guild: anuncios serializados, nunca se pisan
@@ -631,39 +730,7 @@ function escapeSsml(texto: string): string {
     .replace(/'/g, '&apos;');
 }
 
-// Principal: Azure Cognitive Services Speech (REST). Voz neural es-AR, orgánica y estable.
-// Devuelve MP3; el endpoint acepta hasta ~10 min de audio por request, suficiente para el DJ.
-async function generateWithAzure(outFile: string, texto: string): Promise<void> {
-  if (!AZURE_SPEECH_KEY || !AZURE_SPEECH_REGION) {
-    throw new Error('Azure no configurado (AZURE_SPEECH_KEY/AZURE_SPEECH_REGION)');
-  }
-  const lang = AZURE_TTS_VOICE.split('-').slice(0, 2).join('-'); // es-AR-ElenaNeural -> es-AR
-  const ssml =
-    `<speak version='1.0' xml:lang='${lang}'>` +
-    `<voice xml:lang='${lang}' name='${AZURE_TTS_VOICE}'>${escapeSsml(texto)}</voice>` +
-    `</speak>`;
 
-  const res = await fetch(
-    `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`,
-    {
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
-        'User-Agent': 'jsradio',
-      },
-      body: ssml,
-    }
-  );
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`Azure TTS HTTP ${res.status} ${detail.slice(0, 120)}`);
-  }
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length < 200) throw new Error('Azure devolvió audio vacío');
-  await writeFile(outFile, buf);
-}
 
 // Baja un chunk de audio MP3 desde Google Translate TTS.
 async function fetchGoogleTtsChunk(texto: string): Promise<Buffer> {
@@ -690,40 +757,50 @@ async function generateWithGoogle(outFile: string, texto: string): Promise<void>
   await writeFile(outFile, Buffer.concat(buffers));
 }
 
-// Fallback offline: SAPI de Windows (System.Speech). Escribe WAV; ffmpeg lo lee igual.
-// Pasamos texto y script por archivos temporales para evitar el infierno de comillas en PowerShell.
-async function generateWithSapi(outFile: string, texto: string): Promise<void> {
-  const txtFile = outFile.replace(/\.[^.]+$/, '.txt');
-  const ps1File = outFile.replace(/\.[^.]+$/, '.ps1');
-  await writeFile(txtFile, texto, 'utf8');
 
-  const script = [
-    `Add-Type -AssemblyName System.Speech`,
-    `$text = Get-Content -Raw -Encoding UTF8 '${txtFile}'`,
-    `$s = New-Object System.Speech.Synthesis.SpeechSynthesizer`,
-    `try { $s.SelectVoice('${SAPI_VOICE}') } catch {}`,
-    `$s.SetOutputToWaveFile('${outFile}')`,
-    `$s.Speak($text)`,
-    `$s.Dispose()`,
-  ].join('\n');
-  await writeFile(ps1File, script, 'utf8');
 
-  try {
-    await execAsync(
-      `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${ps1File}"`,
-      { timeout: 20000 }
-    );
-  } finally {
-    setTimeout(() => {
-      unlink(txtFile).catch(() => {});
-      unlink(ps1File).catch(() => {});
-    }, 5000);
-  }
+// ─── Gemini TTS
+function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bits = 16): Buffer {
+  const byteRate = (sampleRate * channels * bits) / 8;
+  const blockAlign = (channels * bits) / 8;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bits, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
 }
 
-// Genera un archivo de audio del DJ en cascada: Azure (voz orgánica) → gTTS → SAPI offline.
+async function generateWithGemini(outFile: string, texto: string, voice: string = GEMINI_TTS_VOICE): Promise<void> {
+  if (!GEMINI_API_KEY) throw new Error('sin GEMINI_API_KEY');
+  if (!genaiClient) genaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+  const res = await genaiClient.models.generateContent({
+    model: GEMINI_TTS_MODEL,
+    contents: `Decí esto como locutora de radio chilena, con onda y acento chileno natural: ${texto}`,
+    config: {
+      responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+    } as any,
+  });
+
+  const data = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!data) throw new Error('Gemini TTS sin audio');
+  await writeFile(outFile, pcmToWav(Buffer.from(data, 'base64')));
+}
+
+// Genera un archivo de audio del DJ en cascada: Gemini → Piper → gTTS.
 // El archivo siempre se nombra .mp3 por compatibilidad con el resto del pipeline,
-// pero ffmpeg detecta el formato real por contenido (MP3 de Azure/gTTS o WAV de SAPI).
+// pero ffmpeg detecta el formato real por contenido (MP3 de Gemini/gTTS o WAV de SAPI).
 async function generateTtsMp3(
   guildId: string,
   texto: string,
@@ -732,21 +809,21 @@ async function generateTtsMp3(
 ): Promise<string> {
   const outFile = join(tmpdir(), `jsradio_${guildId}_${Date.now()}.mp3`);
 
-  // 1) Azure Neural (principal) — solo si hay credenciales configuradas.
-  if (AZURE_SPEECH_KEY && AZURE_SPEECH_REGION) {
+  // 1) Gemini TTS (voz femenina chilena) — primaria si hay GEMINI_API_KEY.
+  if (!GEMINI_TTS_DISABLED && GEMINI_API_KEY) {
     for (let i = 0; i < attempts; i++) {
       try {
-        await generateWithAzure(outFile, texto);
+        await generateWithGemini(outFile, texto);
         return outFile;
       } catch (err: any) {
-        console.warn(`⚠️  Azure TTS intento ${i + 1}/${attempts} falló: ${err?.message || err}`);
+        console.warn(`⚠️  Gemini TTS intento ${i + 1}/${attempts} falló: ${err?.message || err}`);
         if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400 * (i + 1)));
       }
     }
-    console.log('🔁 Azure no disponible, cayendo a Piper');
+    console.log('🔁 Gemini TTS no disponible, cayendo a Piper');
   }
 
-  // 2) Piper (neural local, offline e ilimitado) — primario efectivo si está instalado.
+  // 2) Piper (neural local, offline e ilimitado) — funciona sin red ni cuenta.
   if (PIPER_AVAILABLE) {
     try {
       await generateWithPiper(outFile, texto, voiceModel || PIPER_MODEL);
@@ -756,7 +833,7 @@ async function generateTtsMp3(
     }
   }
 
-  // 3) Google Translate TTS (fallback de red).
+  // 3) Google Translate TTS (último recurso, depende de red).
   for (let i = 0; i < attempts; i++) {
     try {
       await generateWithGoogle(outFile, texto);
@@ -767,14 +844,7 @@ async function generateTtsMp3(
     }
   }
 
-  // 4) SAPI offline (último recurso, nunca depende de red).
-  try {
-    console.log('🔁 gTTS no disponible, usando SAPI offline');
-    await generateWithSapi(outFile, texto);
-    return outFile;
-  } catch (err: any) {
-    throw new Error(`TTS falló (Azure + Piper + gTTS + SAPI): ${err?.message || err}`);
-  }
+  throw new Error(`TTS falló en todos los motores (Gemini + Piper + gTTS)`);
 }
 
 // Devuelve la duración (segundos) de un archivo de audio usando ffprobe.
@@ -952,9 +1022,11 @@ async function speakWithDucking(guildId: string, texto: string, voiceModel?: str
       `[bg][voice]amix=inputs=2:duration=first:dropout_transition=0.5:normalize=0`;
 
     const ff = spawn(FFMPEG, [
+      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       '-reconnect', '1',
       '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
+      '-reconnect_on_network_error', '1',
+      '-reconnect_delay_max', '10',
       '-ss', String(elapsed),
       '-i', musicUrl,
       '-i', oggFile,
@@ -1302,9 +1374,13 @@ function spawnFfmpeg(musicUrl: string) {
   // - `-application audio` + `-vbr on` + `-compression_level 10` = mejor calidad música a igual bitrate
   // - 160k es el sweet spot Opus para música; Discord no recomprime más allá del bitrate del canal
   return spawn(FFMPEG, [
+    // User-Agent de navegador: YouTube resetea (WSAECONNRESET / -10054) conexiones
+    // que no parecen un browser. Con esto baja mucho el throttling del CDN.
+    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
+    '-reconnect_on_network_error', '1',
+    '-reconnect_delay_max', '10',
     '-i', musicUrl,
     '-c:a', 'libopus',
     '-b:a', '160k',
@@ -1538,9 +1614,9 @@ async function playCurrentTrack(guildId: string): Promise<void> {
       estado.textChannel.send({ content: msg, embeds: [embed] }).catch(() => {});
     }
 
-    // DJ: comentario contextual con ducking en mitad de la canción (1 por canción, 50% chance).
-    // No usa setTimeout encadenado a la canción — se programa una sola vez al arrancar.
-    if (estado.radioMode && !estado.commentScheduled && Math.random() < 0.5) {
+    // DJ: descripción corta del tema al INICIO, con ducking suave (se escucha música + voz).
+    // Una sola vez por canción, siempre que esté en modo radio.
+    if (estado.radioMode && !estado.commentScheduled) {
       estado.commentScheduled = true;
       const trackSnapshot = track;
       setTimeout(() => {
@@ -1549,7 +1625,7 @@ async function playCurrentTrack(guildId: string): Promise<void> {
         if (e && e.radioMode && e.currentTrack?.url === trackSnapshot.url) {
           playDjAnnouncement(guildId, 'comment', trackSnapshot).catch(() => {});
         }
-      }, 25000); // ~25s adentro de la canción
+      }, 3000); // ~3s después de arrancar la canción
     }
 
     console.log(`▶️ Sonando: ${track.title} en ${guildId}`);

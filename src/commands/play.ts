@@ -45,7 +45,7 @@ export const play: Command = {
               const ytTrack = await engine.searchYouTube(ytQuery);
               if (ytTrack) {
                 tracksToQueue.push({
-                  track: { ...ytTrack, source: 'Spotify' },
+                  track: { ...ytTrack, title: `${t.artist} - ${t.name}`, artist: t.artist, source: 'Spotify' },
                   fuenteHallazgo: info.isPlaylist
                     ? `Spotify Playlist → YouTube (${t.name})`
                     : `Spotify → YouTube (${t.name} — ${t.artist})`,
@@ -87,7 +87,7 @@ export const play: Command = {
             const yt = await engine.searchYouTube(`${s.artist} - ${s.name}`);
             if (yt) {
               tracksToQueue.push({
-                track: { ...yt, source: 'Spotify' },
+                track: { ...yt, title: `${s.artist} - ${s.name}`, artist: s.artist, source: 'Spotify' },
                 fuenteHallazgo: `Spotify → YouTube (${s.name} — ${s.artist})`,
               });
             }
@@ -96,30 +96,27 @@ export const play: Command = {
           const track = await engine.searchSoundCloud(query);
           if (track) tracksToQueue.push({ track, fuenteHallazgo: 'SoundCloud' });
         } else {
-          // auto: 3 fuentes en paralelo
-          const [spotify, ytResult, scResult] = await Promise.all([
-            engine.searchSpotify(query).then(async (s) => {
-              if (!s) return null;
-              const yt = await engine.searchYouTube(`${s.artist} - ${s.name}`);
-              if (!yt) return null;
-              return { track: { ...yt, source: 'Spotify' as const }, fuente: `Spotify → YouTube (${s.name} — ${s.artist})` };
-            }),
-            engine.searchYouTube(query).then((yt) => {
-              if (!yt) return null;
-              return { track: yt, fuente: 'YouTube' };
-            }),
-            engine.searchSoundCloud(query).then((sc) => {
-              if (!sc) return null;
-              return { track: sc, fuente: 'SoundCloud' };
-            }),
-          ]);
-          const ganador = spotify || ytResult || scResult;
-          if (ganador) tracksToQueue.push({ track: ganador.track, fuenteHallazgo: ganador.fuente });
+          // Búsqueda por texto = SOLO Spotify. Para YouTube, se pega el link directo.
+          // El audio igual se sirve desde YouTube porque Spotify NO permite streaming por API.
+          const s = await engine.searchSpotify(query);
+          if (s) {
+            const yt = await engine.searchYouTube(`${s.artist} - ${s.name}`);
+            if (yt) {
+              tracksToQueue.push({
+                track: { ...yt, title: `${s.artist} - ${s.name}`, artist: s.artist, source: 'Spotify' },
+                fuenteHallazgo: `🎵 Spotify · audio servido por YouTube`,
+              });
+            }
+          }
+          // Sin fallback a YouTube/SoundCloud: si no está en Spotify, avisamos.
         }
       }
 
       if (tracksToQueue.length === 0) {
-        await interaction.editReply(`❌ No encontré "${query}" en ninguna plataforma.`);
+        await interaction.editReply(
+          `❌ No encontré "${query}" en Spotify.\n` +
+          `💡 Si es un tema de YouTube, pegá el link directo: \`/play <url de youtube>\`.`
+        );
         return;
       }
 

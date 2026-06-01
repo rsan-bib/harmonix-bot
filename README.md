@@ -14,8 +14,7 @@ Bot de música para Discord (TypeScript + discord.js v14). Reproduce desde YouTu
 | ffmpeg | binario suelto, NO empaquetado | `C:\Users\Roko\ffmpeg\ffmpeg.exe` |
 | yt-dlp | actualizado mensualmente | `C:\Users\Roko\yt-dlp\yt-dlp.exe` |
 | Bot de Discord | con scopes `bot` + `applications.commands` y permisos `Connect`, `Speak`, `Send Messages`, `Use Slash Commands` | — |
-
-Si cambiás de máquina, ajustá las rutas `YTDLP` y `FFMPEG` en `src/bot.ts:35-36`.
+| **GEMINI_API_KEY** | gratis en [ai.google.dev](https://ai.google.dev) (sin tarjeta) | opcional — habilita voz IA + descripciones |
 
 ### Intents requeridos en el portal de Discord
 
@@ -36,14 +35,18 @@ DISCORD_TOKEN=tu_token_de_bot
 SPOTIFY_CLIENT_ID=opcional_pero_recomendado
 SPOTIFY_CLIENT_SECRET=opcional_pero_recomendado
 
-# Opcional: cambiar voz del DJ. Default: es-AR-ElenaNeural
-# Voces es-AR válidas: es-AR-ElenaNeural | es-AR-TomasNeural
-# Otras opciones: es-MX-DaliaNeural, es-ES-ElviraNeural, etc.
-EDGE_TTS_VOICE=es-AR-ElenaNeural
+# TTS en cascada: Gemini → Piper → gTTS
+GEMINI_API_KEY=gratis_en_ai.google.dev
+GEMINI_TTS_VOICE=Kore  # voces: Kore, Leda, Aoede, Zephyr, Autonoe, Callirrhoe
+GEMINI_TTS_DISABLED=1   # comentalo para activar Gemini TTS
+
+# Piper (offline, sin cuenta): descomentar si tenés el binario local.
+# PIPER_EXE=C:\Users\Roko\piper\piper\piper.exe
+# PIPER_MODEL=C:\Users\Roko\piper\models\es_AR-daniela-high.onnx
 ```
 
 - **Sin** credenciales de Spotify el bot sigue funcionando, pero `/play` con URL/búsqueda de Spotify cae en YouTube y el modo radio no puede llenar la cola desde la playlist base.
-- La playlist base del modo radio está cableada en `RADIO_PLAYLIST_ID` (`src/bot.ts:39`). Cambiala si querés otra.
+- La playlist base del modo radio está cableada en `RADIO_PLAYLIST_ID` (`src/bot.ts:51`). Cambiala si querés otra.
 
 ---
 
@@ -168,11 +171,11 @@ Las rutas `YTDLP` y `FFMPEG` en `src/bot.ts:35-36` están cableadas. Si moviste 
 
 ## Arquitectura (resumen rápido)
 
-- **Un único archivo:** `src/bot.ts` (~1300 líneas).
+- **`src/bot.ts`** (~1900 líneas) + **`src/commands/`** (16 archivos, uno por comando).
 - **Estado por guild:** `Map<guildId, GuildState>` con `player`, `connection`, `queue`, `currentTrack`, `ffmpegProcess`, flags de modo radio, etc.
-- **Pipeline de audio:** `yt-dlp` resuelve la URL directa del stream → `ffmpeg` lo recodifica a Opus 192kbps en un pipe → `@discordjs/voice` consume el pipe como `OggOpus`.
-- **TTS del DJ:** `edge-tts-node` genera MP3 → `ffmpeg` lo pasa a Opus → se reproduce en un `announcePlayer` separado, pausando la música mientras dura, y al terminar re-suscribe el player principal y reanuda.
-- **Cache de URLs resueltas:** `audioUrlCache` con TTL de 30 min para evitar llamadas repetidas a yt-dlp.
+- **Pipeline de audio:** `yt-dlp` resuelve la URL directa del stream → `ffmpeg` lo recodifica a Opus 128kbps en un pipe → `@discordjs/voice` consume el pipe como `OggOpus`.
+- **TTS del DJ:** cascada Gemini → Piper → gTTS. El archivo se nombra `.mp3` por convención pero `ffmpeg` detecta el formato real por contenido.
+- **Cache de URLs resueltas:** `audioUrlCache` con TTL de 30 min para evitar llamadas repetidas a `yt-dlp`.
 
 ---
 
@@ -180,7 +183,9 @@ Las rutas `YTDLP` y `FFMPEG` en `src/bot.ts:35-36` están cableadas. Si moviste 
 
 - [ ] Mover rutas `YTDLP`/`FFMPEG` a `.env` para no hardcodearlas.
 - [ ] Tests unitarios (no hay ninguno).
-- [ ] Comando `/volume` (actualmente no implementado).
-- [ ] Comando `/loop` y `/shuffle`.
 - [ ] Persistir cola entre reinicios.
-- [ ] Ducking real de música cuando habla el DJ (hoy se pausa; lo ideal sería bajar volumen y mezclar).
+- [x] Comando `/volume` ✅
+- [x] Comando `/loop` y `/shuffle` ✅
+- [x] Ducking real (música baja + voz a la vez) ✅
+- [x] Descripciones IA de canciones (Gemini) ✅
+- [x] Gemini TTS (voz femenina chilena, gratis) ✅
