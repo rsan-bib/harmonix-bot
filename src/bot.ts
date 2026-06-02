@@ -1213,7 +1213,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.isRepliable()) {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply('❌ Ocurrió un error interno.');
-        } else {
+        } else if (!interaction.isExpired()) {
           await interaction.reply({ content: '❌ Ocurrió un error interno.', ephemeral: true });
         }
       }
