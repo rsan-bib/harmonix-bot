@@ -7,6 +7,9 @@
   "scripts": {
     "start": "tsx src/bot.ts",
     "dev": "tsx watch src/bot.ts",
+    "build": "tsc",
+    "prestart:prod": "node scripts/ensure-ytdlp.mjs",
+    "start:prod": "node dist/bot.js",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
