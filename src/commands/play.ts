@@ -2,6 +2,15 @@ import { SlashCommandBuilder, TextChannel } from 'discord.js';
 import type { VoiceBasedChannel } from 'discord.js';
 import type { Command, Track } from '../types';
 
+// Corre una promesa con límite de tiempo. Si no resuelve dentro de `ms`,
+// devuelve null (no rechaza), para poder caer a un fallback.
+function conLimite<T>(promesa: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    promesa,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
 export const play: Command = {
   needsVoice: true,
   data: new SlashCommandBuilder()
@@ -80,24 +89,14 @@ export const play: Command = {
         if (fuente === 'yt') {
           const track = await engine.searchYouTube(query);
           if (track) tracksToQueue.push({ track, fuenteHallazgo: 'YouTube' });
-        } else if (fuente === 'sp') {
-          const s = await engine.searchSpotify(query);
-          if (s) {
-            const yt = await engine.searchYouTube(`${s.artist} - ${s.name}`);
-            if (yt) {
-              tracksToQueue.push({
-                track: { ...yt, title: `${s.artist} - ${s.name}`, artist: s.artist, source: 'Spotify' },
-                fuenteHallazgo: `Spotify → YouTube (${s.name} — ${s.artist})`,
-              });
-            }
-          }
         } else if (fuente === 'scld') {
           const track = await engine.searchSoundCloud(query);
           if (track) tracksToQueue.push({ track, fuenteHallazgo: 'SoundCloud' });
         } else {
-          // Búsqueda por texto = SOLO Spotify. Para YouTube, se pega el link directo.
-          // El audio igual se sirve desde YouTube porque Spotify NO permite streaming por API.
-          const s = await engine.searchSpotify(query);
+          // Default (Spotify): buscamos en Spotify con un límite de 10s.
+          // Si no aparece (no está, se cuelga o no se resuelve el audio),
+          // caemos automáticamente a búsqueda directa en YouTube.
+          const s = await conLimite(engine.searchSpotify(query), 10_000);
           if (s) {
             const yt = await engine.searchYouTube(`${s.artist} - ${s.name}`);
             if (yt) {
@@ -107,14 +106,23 @@ export const play: Command = {
               });
             }
           }
-          // Sin fallback a YouTube/SoundCloud: si no está en Spotify, avisamos.
+          // Fallback a YouTube si Spotify no dio nada usable.
+          if (tracksToQueue.length === 0) {
+            const yt = await engine.searchYouTube(query);
+            if (yt) {
+              tracksToQueue.push({
+                track: yt,
+                fuenteHallazgo: '🔁 No estaba en Spotify · buscado en YouTube',
+              });
+            }
+          }
         }
       }
 
       if (tracksToQueue.length === 0) {
         await interaction.editReply(
-          `❌ No encontré "${query}" en Spotify.\n` +
-          `💡 Si es un tema de YouTube, pegá el link directo: \`/play <url de youtube>\`.`
+          `❌ No encontré "${query}" ni en Spotify ni en YouTube.\n` +
+          `💡 Probá con otro nombre o pegá el link directo: \`/play <url>\`.`
         );
         return;
       }
