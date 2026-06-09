@@ -1210,6 +1210,7 @@ client.on('interactionCreate', async (interaction) => {
   } catch (err: any) {
     console.error('❌ Error en interactionCreate:', err);
     try {
+      if (!interaction.isRepliable()) return;
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply('❌ Ocurrió un error interno.').catch(() => {});
       } else {
