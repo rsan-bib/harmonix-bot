@@ -1,0 +1,4 @@
+# Los scripts de shell DEBEN tener saltos de línea LF, o fallan en Termux/Linux
+# con "bad interpreter: /bin/bash^M". Forzamos LF sin importar el SO del autor.
+*.sh text eol=lf
+*.mjs text eol=lf
