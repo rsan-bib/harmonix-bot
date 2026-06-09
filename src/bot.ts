@@ -1210,15 +1210,14 @@ client.on('interactionCreate', async (interaction) => {
   } catch (err: any) {
     console.error('❌ Error en interactionCreate:', err);
     try {
-      if (interaction.isRepliable()) {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply('❌ Ocurrió un error interno.');
-        } else {
-          await interaction.reply({ content: '❌ Ocurrió un error interno.', ephemeral: true });
-        }
+      if (!interaction.isRepliable()) return;
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('❌ Ocurrió un error interno.').catch(() => {});
+      } else {
+        await interaction.reply({ content: '❌ Ocurrió un error interno.', ephemeral: true }).catch(() => {});
       }
     } catch {
-      // No se pudo responder
+      // Interaction expiró, imposible responder
     }
   }
 });

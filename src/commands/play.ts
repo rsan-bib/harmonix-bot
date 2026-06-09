@@ -13,12 +13,11 @@ export const play: Command = {
     .addStringOption((opt) =>
       opt
         .setName('fuente')
-        .setDescription('auto, yt, sp o scld')
+        .setDescription('Catálogo de búsqueda (por defecto: Spotify)')
         .setRequired(false)
         .addChoices(
-          { name: 'auto — Spotify, YouTube, SoundCloud', value: 'auto' },
+          { name: 'sp — Spotify (predeterminado)', value: 'sp' },
           { name: 'yt — solo YouTube', value: 'yt' },
-          { name: 'sp — solo Spotify', value: 'sp' },
           { name: 'scld — solo SoundCloud', value: 'scld' }
         )
     ),
@@ -26,7 +25,7 @@ export const play: Command = {
   async execute({ interaction, guildId, member, engine }) {
     await interaction.deferReply();
     const query = interaction.options.getString('cancion', true);
-    const fuente = interaction.options.getString('fuente') || 'auto';
+    const fuente = interaction.options.getString('fuente') || 'sp';
     const voiceChannel = member.voice?.channel as VoiceBasedChannel;
     const textChannel = interaction.channel as TextChannel;
 

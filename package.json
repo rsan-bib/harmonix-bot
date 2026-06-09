@@ -5,8 +5,11 @@
   "description": "Harmonix — Discord music bot (no TTS, just music)",
   "main": "src/bot.ts",
   "scripts": {
-    "start": "ts-node src/bot.ts",
-    "dev": "ts-node --watch src/bot.ts",
+    "start": "tsx src/bot.ts",
+    "dev": "tsx watch src/bot.ts",
+    "build": "tsc",
+    "prestart:prod": "node scripts/ensure-ytdlp.mjs",
+    "start:prod": "node dist/bot.js",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
@@ -21,7 +24,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.16",
-    "ts-node": "^10.9.2",
+    "tsx": "^4.19.0",
     "typescript": "^5.3.3"
   }
 }

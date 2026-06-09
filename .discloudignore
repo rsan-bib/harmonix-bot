@@ -1,0 +1,9 @@
+# Discloud instala las dependencias en el servidor: no subas node_modules.
+node_modules/
+.git/
+*.log
+*.pdf
+*.lnk
+bin/
+temp/
+# src no es necesario en runtime (se ejecuta dist/), pero es liviano: se deja por si querés depurar.
